@@ -26,10 +26,25 @@ pip3 install -e .
 
 Perhaps slap on a virtualenv if you're that kind of a person.
 
-## Rudimentary Demo
+## How to run
+
+Live simulation with the PX4-like controller
+
 
 ```sh
 python3 -m squad.dyn squad.dyn.mc.Quad squad.px4.Agent
+```
+
+Same with the DDP-based trajectory optimizer
+
+```sh
+python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.load_policy
+```
+
+Visualization of trajectory optimization (recommended viewing, very satisfying)
+
+```sh
+python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.load_policy
 ```
 
 ## FAQ
@@ -51,3 +66,11 @@ question. Or MLAQ. Maximum likelihood asked question.
 Q: Can I read the thesis you wrote on this stuff?
 
 A: Let me just finish it first.
+
+Q: The DDP thingy is too slow.
+
+A: Yes, that was what my thesis was about.
+
+## Screenshot
+
+![Screenshot](screenshot.png)
