@@ -23,6 +23,7 @@ Xnorm[13:, 13:] = 0.0
 
 log = logging.getLogger(__name__)
 
+NUM_STEPS_SHOW = env_param('show_steps', default=500, cast=int)
 NUM_LOOKAHEAD = env_param('traj_length', default=2000, cast=int)
 DYNAMICS = env_param('dynamics', default='analytical', cast=str)
 METHOD = env_param('method', default='ddp', cast=str)
@@ -389,7 +390,7 @@ def gui():
         def _update(self, lines, x0, U_, **kw):
             U = U_.reshape((-1,) + model.action_shape)
             #t, X, U, R = model.steps(x0, U, dt=DT)
-            X = model.step_array(x0, U, dt=DT)
+            X = model.step_array(x0, U[:NUM_STEPS_SHOW], dt=DT)
             history = traj.from_parts(states=X, actions=U, dt=DT)
             lines.setData(**self.viewer.plot_traj_kwds(history, **kw))
 
