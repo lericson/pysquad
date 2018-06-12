@@ -157,7 +157,9 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
         U = u.reshape((n,) + action_shape)
         (x0,) = args
         try:
-            X, U = ddp_solve(x0, dt=dt, callback=callback, initial=U)
+            X, U = ddp_solve(x0, dt=dt, callback=callback, initial=U,
+                             atol=5e0, λ_base=3.0, ln_λ=0, ln_λ_max=15,
+                             iter_max=500)
         except:
             log.exception('ddp solve failed')
         return optimize.OptimizeResult(x=U.flatten(), fun=cost(U.flatten(), x0), success=True)
@@ -243,13 +245,13 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
         elif method == 'basinhopping':
             cb = (lambda uk, f=None, accept=True: callback_opt(x0, uk)) if callback_opt else None
             result = optimize.basinhopping(cost, u_init.flatten(),
-                                           minimizer_kwargs={'method': 'L-BFGS-B',
-                                                             'bounds': bounds,
-                                                             'jac': jac,
-                                                             'callback': cb,
-                                                             'args': (x0,)},
-                                           #minimizer_kwargs={'method': ddp_minimizer,
+                                           #minimizer_kwargs={'method': 'L-BFGS-B',
+                                           #                  'bounds': bounds,
+                                           #                  'jac': jac,
+                                           #                  'callback': cb,
                                            #                  'args': (x0,)},
+                                           minimizer_kwargs={'method': ddp_minimizer,
+                                                             'args': (x0,)},
                                            callback=cb, **opt_opts)
             result.success = True
 
