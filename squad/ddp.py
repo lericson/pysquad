@@ -222,7 +222,7 @@ def cost_matrices():
 
     # Here L is the sum of projections of body axes onto inertial frame, plus
     # extra for Z.
-    q_axis_x, q_axis_y, q_axis_z = 3e0, 3e0, 5e0
+    q_axis_x, q_axis_y, q_axis_z = 6e0, 6e0, 1e1
     Qf[iqi] = -q_axis_x + q_axis_y + q_axis_z
     Qf[iqj] = +q_axis_x - q_axis_y + q_axis_z
     Qf[iqk] = +q_axis_x + q_axis_y - q_axis_z
@@ -271,13 +271,13 @@ def load(dt=None, T=None, dynamics='analytical', initial_actions=initial_actions
         return V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux
 
     #@nb.njit(cache=True, nogil=True)
-    def ddp(x0, x_goal, U, dt, ln_λ=-10, ln_λ_max=55, λ_base=1.5,
-            iter_max=2000, rtol=1e-4, noise=False, callback=None):
+    def ddp(x0, x_goal, U, dt, ln_λ=-5, ln_λ_max=55, λ_base=1.5,
+            iter_max=2000, atol=5e-1, callback=None, return_controllers=False):
         t0     = time.time()
         T      = U.shape[0]
         X      = model.step_array(x0, U, dt=dt)
-        k      = np.empty((T,) + action_shape)
-        K      = np.empty((T,) + action_shape + state_shape)
+        k_new  = np.empty((T,) + action_shape)
+        K_new  = np.empty((T,) + action_shape + state_shape)
         fx     = np.empty((T,) + state_shape + state_shape)
         fu     = np.empty((T,) + state_shape + action_shape)
         lx     = np.empty((T,) + state_shape)
@@ -298,23 +298,23 @@ def load(dt=None, T=None, dynamics='analytical', initial_actions=initial_actions
         ln_λ_start = ln_λ
         line_search_failed = True
         for i in range(iter_max):
-            if not all(np.all(np.isfinite(d)) for d in derivs):
-                log.warn('non-finite derivatives:\n%s', derivs)
+            #if not all(np.all(np.isfinite(d)) for d in derivs):
+            #    log.warn('non-finite derivatives:\n%s', derivs)
             try:
-                backward_pass(K, k, *derivs, λ_base**ln_λ)
+                backward_pass(K_new, k_new, *derivs, λ_base**ln_λ)
             except np.linalg.LinAlgError as e:
-                log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
+                #log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
                 ln_λ += 1
                 continue
-            X_new, U_new = forward_pass(K, k, X, U, dt=dt, noise=noise)
+            X_new, U_new = forward_pass(K_new, k_new, X, U, dt=dt)
             c_new = cost.trajectory(X_new, U_new, x_goal)
             change = c - c_new
-            if change/abs(c) > rtol:
+            if change > atol or (change > 0 and n_updt == 0):
                 log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
-                c, X, U = c_new, X_new, U_new
+                c, X, U, K, k = c_new, X_new, U_new, K_new.copy(), k_new.copy()
                 derivs = _calc_derivatives(cost, X, U, x_goal, dt, fx, fu, lx, lu, lxx, lxu, luu, lux)
-                ln_λ -= 1
                 n_updt += 1
+                ln_λ -= 1
                 line_search_failed = False
                 if callback is not None:
                     callback(U)
@@ -331,39 +331,83 @@ def load(dt=None, T=None, dynamics='analytical', initial_actions=initial_actions
         t1 = time.time()
         log.info('ddp done. %2d upd %3d iters %5.3g s, c_init: %.5g, c: %.5g, %%ch: %.5g',
                  n_updt, i, t1 - t0, c_init, c, (c_init - c)/abs(c_init))
-        return TrajTuple(X, U)
+        trj = TrajTuple(X, U)
 
-    def solve(x0, *, initial=None, noise=True, dt=dt, T=T, **kw):
+        if return_controllers:
+            return trj, K, k
+        else:
+            return trj
+
+    def solve(x0, *, initial=None, dt=dt, T=T, **kw):
         assert dt is not None
         assert ((initial is None) ^ (T is None)) or (initial.shape[0] == T)
         if initial is None:
-            _, initial = initial_actions(x0, T=T, dt=dt, noise=noise)
-        return ddp(x0, x_goal, initial, dt=dt, noise=noise, **kw)
+            _, initial = initial_actions(x0, T=T, dt=dt)
+        return ddp(x0, x_goal, initial, dt=dt, **kw)
     return solve
 
 def load_policy(T=Tl, dt=DT, tolerance=2e0):
     solve = load(T=T, dt=dt)
-    x1, initial = None, None
+    X, U, Ks, ks, th, t = None, None, None, None, None, 0
     Qf, Q, R = cost_matrices()
+    import threading
+    lock = threading.Lock()
+    def cb(x0, U):
+        if hasattr(action, 'tracker'):
+            action.tracker.set_trajectory(TrajTuple(model.step_array(x0, U, dt), U))
     def action(x0):
-        nonlocal x1, initial
-        q = qf(Q, x0 - x1) if x1 is not None else np.inf
-        if q > tolerance:
-            log.warn('x1 too far from x0, resetting initial guess (q: %.3g)', q)
-            initial = None
-        #states, actions = solve(x0, initial=initial, rtol=1e-2)
-        states, actions = solve(x0, initial=initial, dt=dt, noise=False,
-                                rtol=1e-3, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
-                                iter_max=80)
-        #_, x1, _ = model.step(x0, actions[0], dt=dt)
-        x1 = states[1]
-        initial = np.vstack((actions[1:], actions[-1]))
-        return actions[0]
+        nonlocal X, U, Ks, ks, th, t
+        q = qf(Q, (X[t] - x0)) if X is not None else np.inf
+        if q < tolerance:
+            with lock:
+                dists = np.linalg.norm(X[t:t+10, 0:3] - x0[0:3], axis=1)
+                t = t + dists.argmin()
+                log.info('using linear control t=%d', t)
+                X[t]=x0
+                #X = model.step_array(X[0], U, dt)
+                X[t:], U[t:] = forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:], dt)
+                #u = clip_action(U[t] + Ks[t] @ (X[t] - x0))
+                if X.shape[0] < 5:
+                    X, U, Ks, ks = None, None, None, None
+            if th is None or not th.is_alive():
+                #X, U, Ks, ks, t = X[t:], U[t:], Ks[t:], ks[t:], 0
+                th = threading.Thread(target=update, args=(t+100,))
+                th.start()
+            time.sleep(0.0125)
+            return U[t]
+        log.info('synchronouosly optimizing trajectory')
+        if th is not None:
+            th.join()
+        (X, U), Ks, ks = solve(x0, initial=None, dt=dt, callback=lambda U: cb(x0, U),
+                               atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
+                               iter_max=50, return_controllers=True)
+        t = 0
+        return U[t]
+        #states, actions = solve(x0, initial=U, atol=1e-2)
+    def update(n):
+        "Update current trajectory estimate from point n."
+        nonlocal X, U, Ks, ks
+        U_ = U
+        if U_ is not None:
+            U_ = U_[n:][:T]
+            # TODO Fill in using K
+            filler = np.repeat(U_[-1][None], T-U_.shape[0], axis=0)
+            U_ = np.vstack((U_, filler))
+        trj, Ks_, ks_ = solve(X[n], initial=U_, dt=dt, callback=lambda U: cb(X[n], U),
+                              atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
+                              iter_max=50, return_controllers=True)
+        with lock:
+            X = np.vstack((X[:n], trj.states))
+            U = np.vstack((U[:n], trj.actions))
+            Ks = np.vstack((Ks[:n], Ks_))
+            ks = np.vstack((ks[:n], ks_))
+        #X = np.vstack((trj.states[1:],  trj.states[-1]))
+        #U = np.vstack((trj.actions[1:], trj.actions[-1]))
     return action
 
 def main(dt=DT, T=500, Tl=Tl, Tstep=1, n=10):
     import logcolor
-    logcolor.basic_config(level=logging.INFO)
+    logcolor.basic_config(level=logging.DEBUG)
     solve = load(T=Tl, dt=dt)
     x0 = model.state(position=(5, 5, 0), velocity=(2, 2, 0))
     for i in range(n):
