@@ -52,20 +52,22 @@ def mad(*thread_objs):
 def main(args=sys.argv[1:]):
     logcolor.basic_config(level=logging.INFO)
     model_spec, policy_spec, *init_state = args
+    tracker = traj.Tracker()
     model = import_name(model_spec)()
     policy = import_name(policy_spec)()
+    policy.tracker = tracker.alt(color='g')
     if init_state:
         x0 = np.array(list(map(eval, init_state)), dtype=np.float64)
     else:
         x0 = model.sample_states()[0, :]
     #x0 = np.r_[1, 1, 1, 1, 1, 1]
-    tracker = traj.Tracker()
-    callback = tracker.set_history
-    thread_unroll = threadwrap(model.unroll)
-
     log.info('initial state:\n%s', model.state_rep(x0))
     dt = env_param('dt', default=1/400, cast=float)
-    t = thread_unroll(policy=policy, x0=x0, dt=dt, callback=callback,
+    policy_noise = lambda x: np.random.normal(policy(x), 1e-2)
+
+    thread_unroll = threadwrap(model.unroll)
+    t = thread_unroll(policy=policy_noise, x0=x0, dt=dt,
+                      callback=tracker.set_history,
                       t_min=env_param('t_min', default=1.0, cast=float),
                       t_max=env_param('t_max', default=60.0, cast=float),
                       q_min=env_param('q_min', default=1e-4, cast=float))
