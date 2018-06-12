@@ -133,20 +133,38 @@ class Viewer():
         QtGui.QApplication.instance().exec_()
 
 class Tracker(Viewer):
-    def __init__(self, *args, **kwds):
-        super().__init__(*args, **kwds)
-        self.line_plot = self.plot_traj([])
+    def __init__(self, *args, autopan=True, axis=True, parent=None,
+                 plot_opts={}, **kwds):
+        if parent is None:
+            super().__init__(*args, **kwds)
+        else:
+            self.app = parent.app
+            self.w = parent.w
+        self.autopan = autopan
         from .trajview import AxisItem
-        self.axis = AxisItem(antialias=True)
-        self.axis.setSize(x=0.1, y=0.1, z=0.1)
+        if axis:
+            self.axis = AxisItem(antialias=True)
+            self.axis.setSize(x=0.1, y=0.1, z=0.1)
+        else:
+            self.axis = None
         self.w.addItem(self.axis)
+        self.plot_opts = plot_opts
+        self.line_plot = self.plot_traj([], **self.plot_opts)
 
     def set_history(self, history):
-        self.line_plot.setData(**self.plot_traj_kwds(history))
+        self.line_plot.setData(**self.plot_traj_kwds(history, **self.plot_opts))
         _, x1, *_ = history[-1]
-        self.pan(*x1[0:3])
-        self.axis.position = x1[0:3]
-        self.axis.orientation = x1[3:7]
+        if self.autopan:
+            self.pan(*x1[0:3])
+        if self.axis:
+            self.axis.position = x1[0:3]
+            self.axis.orientation = x1[3:7]
+
+    def set_trajectory(self, trj):
+        self.set_history([(None, x, u, None, None) for x, u in zip(trj.states, trj.actions)])
+
+    def alt(self, **kwds):
+        return type(self)(parent=self, autopan=False, plot_opts=kwds)
 
 def main(args=sys.argv[1:]):
     logcolor.basic_config()

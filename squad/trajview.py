@@ -368,6 +368,7 @@ class GLViewWidget(QtOpenGL.QGLWidget):
                     self.orbit(azim=0, elev=speed)
                 elif key == QtCore.Qt.Key_H:
                     self.pan(0, 0, 0, relative=False)
+                    self.opts['distance'] = 10.0
                 elif key == QtCore.Qt.Key_PageUp:
                     pass
                 elif key == QtCore.Qt.Key_PageDown:
