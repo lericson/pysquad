@@ -48,7 +48,7 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
 
     if expensive_initial_guess:
         def initial(x0, *, n, initial=None):
-            return ddp_solve(x0, T=n, dt=dt, initial=initial, noise=False)
+            return ddp_solve(x0, T=n, dt=dt, initial=initial)
     else:
         def initial(x0, *, n=n):
             policy = init_policy()
@@ -218,7 +218,7 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
                     if st_exp < -45:
                         break
             if c_prev <= c_best or (i % 10) == 0:
-                _, u_new = ddp_solve(x0, initial=u_new.reshape((n,) + action_shape), dt=dt, noise=True, callback=callback)
+                _, u_new = ddp_solve(x0, initial=u_new.reshape((n,) + action_shape), dt=dt, callback=callback)
                 u_new = u_new.flatten()
                 c_new = cost(u_new, x0)
                 if c_new < c_best:
@@ -261,8 +261,8 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
 
         elif method == 'ddp':
             cb = (lambda uk: callback_opt(x0, uk)) if callback_opt else None
-            _, u_opt = ddp_solve(x0, initial=u_init, dt=dt, callback=cb, noise=False, rtol=1e-3, λ_base=3.0, ln_λ=-5, ln_λ_max=20, iter_max=80)
-            _, u_opt = ddp_solve(x0, initial=u_opt,  dt=dt, callback=cb, noise=False, rtol=1e-3, λ_base=2.0, ln_λ=0,  ln_λ_max=30, iter_max=120)
+            _, u_opt = ddp_solve(x0, initial=u_init, dt=dt, callback=cb, atol=5e0, λ_base=3.0, ln_λ=0, ln_λ_max=15, iter_max=500)
+            #_, u_opt = ddp_solve(x0, initial=u_opt,  dt=dt, callback=cb, atol=5e0, λ_base=2.0, ln_λ=0, ln_λ_max=20, iter_max=120)
             result = optimize.OptimizeResult(success=True, x=u_opt)
 
         elif method == 'gd':
