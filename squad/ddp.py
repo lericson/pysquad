@@ -15,8 +15,8 @@ make_policy = px4.Agent
 TrajTuple = namedtuple('TrajTuple', 'states actions')
 
 log = logging.getLogger(__name__)
-DT = env_param('dt', default=1/100, cast=float)
-Tl = env_param('ddp_lookahead', default=100, cast=int)
+DT = env_param('dt', default=1/400, cast=float)
+Tl = env_param('ddp_lookahead', default=2000, cast=int)
 
 x_dot = model.x_dot
 step_eul = model.step_eul
@@ -27,24 +27,18 @@ action_shape = model.action_shape
 state_noise = 2e-7/DT
 action_noise = 2e-6/DT
 
-def initial_actions(x0, *, T, dt, noise=True):
+def initial_actions(x0, *, T, dt):
     policy = make_policy()
     U = np.empty((T, *model.action_shape))
     X = np.empty((T+1, *model.state_shape))
     #ε_u = np.random.normal(0.0, action_noise, size=U.shape)
     #ε_x = np.random.normal(0.0, state_noise, size=X.shape)
     X[0] = x0
-    #if noise:
-    #    X[0] += ε_x[0]
     for i in range(T):
         U[i] = policy(X[i])
-        #if noise:
-        #    U[i] += ε_u[i]
         U[i] = clip(U[i], u_lower, u_upper)
         X[i+1]  = X[i]
         X[i+1] += dt*x_dot(0.0, X[i], U[i])
-        #if noise:
-        #    X[i+1] += ε_x[i+1]
     return TrajTuple(X, U)
 
 @nb.njit('f8[:](f8[:])', cache=True, nogil=True)
@@ -57,23 +51,44 @@ def clip_action(u):
     return u
 
 @nb.njit(cache=True, nogil=True)
-def forward_pass(K, k, X, U, dt, noise=True):
+def forward_pass(K, k, X, U, dt):
     X_new = np.empty_like(X)
     U_new = np.empty_like(U)
     #ε_x = np.random.normal(0.0, state_noise, size=X.shape)
     #ε_u = np.random.normal(0.0, action_noise, size=U.shape)
     X_new[0] = X[0]
-    #if noise:
-    #    X_new[0] += ε_x[0]
     for i in range(U.shape[0]):
         U_new[i] = clip_action(U[i] + k[i] + K[i] @ (X_new[i] - X[i]))
-        #if noise:
-        #    U_new[i] += ε_u[i]
         X_new[i+1] = step_eul(X_new[i], U_new[i], dt=dt)
-        #if noise:
-        #    X_new[i+1] += ε_x[i+1]
         #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
     return X_new, U_new
+
+@nb.njit(cache=True, nogil=True)
+def inv_reg(A, λ):
+    "Regularized inversion of A."
+    # Method 1: plain old inversion.
+    # Variant 1a: plain old inversion.
+    #A_reg = A.copy()
+    #for j in range(A.shape[0]):
+    #    A_reg += λ
+    #    A_reg += λ*A[j, j]
+    #return np.linalg.inv(reg)
+
+    # Method 2: eigendecomposition
+    #eigvals, eigvecs = np.linalg.eig(A.astype(np.complex128))
+    #eigvals[eigvals.real < 1e-9] = 0.0
+    #eigvals[eigvals.imag != 0.0] = 0.0
+    #eigvals  += λ
+    #eigvalinv = np.diag(1.0/eigvals)
+    #A_inv   = (eigvecs @ eigvalinv @ eigvecs.T).real
+    #return A_inv
+
+    # Method 3: SVD, by far faster than eigendecomposition
+    U, s, V = np.linalg.svd(A)
+    for j in range(action_shape[0]):
+        s[j] = 1.0/(s[j] + λ)
+        #s[j] = 1.0/(s[j] + λ**2/s[j] + eps)
+    return U@(s*V)
 
 @nb.njit(cache=True, nogil=True)
 def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux, λ):
@@ -86,72 +101,27 @@ def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux, λ):
     V_x  = V_x.copy()
     V_xx = V_xx.copy()
     for i in range(T-1, -1, -1):
-        np.dot(fx[i].T, V_x, out=Qx)
-        Qx += lx[i]
-        np.dot(fu[i].T, V_x, out=Qu)
-        Qu += lu[i]
+        # Calculate Qx, Qu, Qxx, Quu, Qxu.
+        np.dot(fx[i].T, V_x, out=Qx); Qx += lx[i]
+        np.dot(fu[i].T, V_x, out=Qu); Qu += lu[i]
         fxTV_xx = np.dot(fx[i].T, V_xx)
         fuTV_xx = np.dot(fu[i].T, V_xx)
-        np.dot(fxTV_xx, fx[i], out=Qxx)
-        Qxx += lxx[i]
-        np.dot(fuTV_xx, fu[i], out=Quu)
-        Quu += luu[i]
-        np.dot(fuTV_xx, fx[i], out=Qux)
-        Qux += lux[i]
-        #if not np.all(np.isfinite(fx)):
-        #    log.error('fx non-finite')
-        #if not np.all(np.isfinite(fu)):
-        #    log.error('fu non-finite')
-        #if not np.all(np.isfinite(lx)):
-        #    log.error('lx non-finite')
-        #if not np.all(np.isfinite(lu)):
-        #    log.error('lu non-finite')
-        #if not np.all(np.isfinite(lxx)):
-        #    log.error('lxx non-finite')
-        #if not np.all(np.isfinite(luu)):
-        #    log.error('luu non-finite')
-        #if not np.all(np.isfinite(Qxx)):
-        #    log.error('Qxx non-finite')
-        #if not np.all(np.isfinite(Quu)):
-        #    log.error('Quu non-finite')
-        #if not np.all(np.isfinite(V_x)):
-        #    log.error('V_x non-finite')
-        #if not np.all(np.isfinite(V_xx)):
-        #    log.error('V_xx non-finite')
-        #neg_Quu_inv = -np.linalg.inv(Quu)
-        Quu_eigvals, Quu_eigvecs = np.linalg.eig(Quu.astype(np.complex128))
-        Quu_eigvals[Quu_eigvals.real < 1e-9] = 0.0
-        Quu_eigvals[Quu_eigvals.imag != 0.0] = 0.0
-        #for j in range(action_shape[0]):
-        #    Quu_eigvals += λ*Quu[j, j]
-        Quu_eigvals += λ
-        Quu_eigvalinv = np.diag(1.0/Quu_eigvals)
-        neg_Quu_inv = (Quu_eigvecs @ Quu_eigvalinv @ Quu_eigvecs.T).real
+        np.dot(fxTV_xx, fx[i], out=Qxx); Qxx += lxx[i]
+        np.dot(fuTV_xx, fu[i], out=Quu); Quu += luu[i]
+        np.dot(fuTV_xx, fx[i], out=Qux); Qux += lux[i]
+
+        # Inversion of Quu. Very important stuff.
+        neg_Quu_inv  = inv_reg(Quu, λ)
         neg_Quu_inv *= -1
+
+        # Compute k, K, Vx, Vxx.
         np.dot(neg_Quu_inv, Qu,  out=k[i])
         np.dot(neg_Quu_inv, Qux, out=K[i])
         neg_KTQuu  = np.dot(K[i].T, Quu)
         neg_KTQuu *= -1
-        np.dot(neg_KTQuu, k[i], out=V_x)
-        V_x += Qx
-        np.dot(neg_KTQuu, K[i], out=V_xx)
-        V_xx += Qxx
-        #if not np.all(np.isfinite(neg_Quu_inv[i])):
-        #    log.error('neg_Quu_inv non-finite')
-        #if not np.all(np.isfinite(K[i])):
-        #    log.error('K non-finite')
-        #if not np.all(np.isfinite(V_x)):
-        #    log.error('V_x non-finite after projection')
-        #if not np.all(np.isfinite(V_xx)):
-        #    log.error('V_xx non-finite after projection')
+        np.dot(neg_KTQuu, k[i], out=V_x); V_x += Qx
+        np.dot(neg_KTQuu, K[i], out=V_xx); V_xx += Qxx
     return K, k
-
-# ### OUTPUT ON FAILURE:
-# [2018-04-23 22:40:51] ddp.py:109 ERROR experiments.ddp: V_x non-finite after projection
-# [2018-04-23 22:40:51] ddp.py:111 ERROR experiments.ddp: V_xx non-finite after projection
-# [2018-04-23 22:40:51] ddp.py:85 ERROR experiments.ddp: Qxx non-finite
-# [2018-04-23 22:40:51] ddp.py:87 ERROR experiments.ddp: Quu non-finite
-# [2018-04-23 22:40:51] ddp.py:89 ERROR experiments.ddp: V_xx non-finite
 
 @nb.jitclass([('Qf', nb.float64[:, ::1]),
               ('Q', nb.float64[:, ::1]),
@@ -407,8 +377,8 @@ def main(dt=DT, T=500, Tl=Tl, Tstep=1, n=10):
             states_j, actions_j = solve(states[j], initial=initial)
             states[j:k+1], actions[j:k] = states_j[:Tstep+1], actions_j[:Tstep]
             #filler = np.zeros((Tstep, *model.action_shape))
-            filler = initial_actions(states[k], T=Tstep, dt=dt).actions
-            #filler = np.repeat(actions_j[-1][None], Tstep, axis=0)
+            #filler = initial_actions(states[k], T=Tstep, dt=dt).actions
+            filler = np.repeat(actions_j[-1][None], Tstep, axis=0)
             #filler = np.random.uniform(u_lower, u_upper, size=(Tstep, *model.action_shape))
             initial = np.vstack((actions_j[Tstep:], filler))
         #states = model.step_array(x0, actions, dt=dt)
