@@ -373,7 +373,6 @@ def load_policy(T=Tl, dt=DT, tolerance=2e0):
                 #X, U, Ks, ks, t = X[t:], U[t:], Ks[t:], ks[t:], 0
                 th = threading.Thread(target=update, args=(t+100,))
                 th.start()
-            time.sleep(0.0125)
             return U[t]
         log.info('synchronouosly optimizing trajectory')
         if th is not None:
