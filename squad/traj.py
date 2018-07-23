@@ -10,6 +10,9 @@ from . import plots
 log = logging.getLogger(__name__)
 
 class Trajectory(namedtuple('TrajectoryBase', 'dt states obs actions rewards')):
+    def __new__(cls, *, dt, states, actions, obs=None, rewards=None):
+        return super().__new__(cls, dt, states, obs, actions, rewards)
+
     def save(self, fn, **kw):
         np.savez(fn, dt=self.dt, states=self.states, obs=self.obs,
                  actions=self.actions, rewards=self.rewards, **kw)
@@ -58,10 +61,13 @@ def load_many(fn):
 def save_many(fn, histories):
     all_items = {}
     for i, history in enumerate(histories):
-        trj = Trajectory.from_history(history)
+        if hasattr(history, 'states'):
+            trj = history
+        else:
+            trj = Trajectory.from_history(history)
         items = dict(dt=trj.dt, states=trj.states, obs=trj.obs,
                      actions=trj.actions, rewards=trj.rewards)
-        all_items.update({f't{i}_{k}': v for k, v in items.items()})
+        all_items.update({f't{i}_{k}': v for k, v in items.items() if v is not None})
     np.savez(fn, **all_items)
 
 def from_parts(*, t0=0.0, dt, states, obses=None, actions=None, rewards=None, **kw):

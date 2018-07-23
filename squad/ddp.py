@@ -5,7 +5,7 @@ from collections import namedtuple
 import numpy as np
 import numba as nb
 
-from . import px4
+from . import px4, traj
 from .dyn import mc
 from .utis import clip, env_param, qf
 #from models.pointmass import PointMass
@@ -359,22 +359,23 @@ def load_policy(T=Tl, dt=DT, tolerance=2e0):
         nonlocal X, U, Ks, ks, th, t
         q = qf(Q, (X[t] - x0)) if X is not None else np.inf
         if q < tolerance:
-            with lock:
-                dists = np.linalg.norm(X[t:t+10, 0:3] - x0[0:3], axis=1)
-                t = t + dists.argmin()
-                log.info('using linear control t=%d', t)
-                X[t]=x0
-                #X = model.step_array(X[0], U, dt)
-                X[t:], U[t:] = forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:], dt)
-                #u = clip_action(U[t] + Ks[t] @ (X[t] - x0))
-                if X.shape[0] < 5:
-                    X, U, Ks, ks = None, None, None, None
+            dists = np.linalg.norm(X[t:t+10, 0:3] - x0[0:3], axis=1)
+            t = t + dists.argmin()
+            #log.debug('using linear control t=%d', t)
+            X[t]=x0
+            #X = model.step_array(X[0], U, dt)
+            X[t:], U[t:] = forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:], dt)
+            #u = clip_action(U[t] + Ks[t] @ (X[t] - x0))
+            if X.shape[0] < 5:
+                X = None
             if th is None or not th.is_alive():
                 #X, U, Ks, ks, t = X[t:], U[t:], Ks[t:], ks[t:], 0
                 th = threading.Thread(target=update, args=(t+100,))
                 th.start()
             return U[t]
-        log.info('synchronouosly optimizing trajectory')
+        if X is not None:
+            log.warn('ran out of controls mid-flight, stopping time')
+        log.info('optimizing trajectory')
         if th is not None:
             th.join()
         (X, U), Ks, ks = solve(x0, initial=None, dt=dt, callback=lambda U: cb(x0, U),
@@ -404,30 +405,40 @@ def load_policy(T=Tl, dt=DT, tolerance=2e0):
         #U = np.vstack((trj.actions[1:], trj.actions[-1]))
     return action
 
-def main(dt=DT, T=500, Tl=Tl, Tstep=1, n=10):
+def main(dt=DT, T=Tl, Tl=Tl, Tstep=Tl, n=10):
     import logcolor
     logcolor.basic_config(level=logging.DEBUG)
+
     solve = load(T=Tl, dt=dt)
-    x0 = model.state(position=(5, 5, 0), velocity=(2, 2, 0))
-    for i in range(n):
-        log.info('sample %d', i)
-        log.info('x0:\n%s', model.state_rep(x0))
+
+    initials = []
+    optimizeds = []
+
+    for i, x0 in enumerate(model.sample_states(n)):
+        log.info('sample %d, x0:\n%s', i, model.state_rep(x0))
+
         states, actions = initial_actions(x0, T=T, dt=dt)
-        np.savez(f'ddp{i}_pid.npz', actions=actions, states=states, dt=dt)
+        initials.append(traj.Trajectory(dt=dt, states=states.copy(), actions=actions.copy()))
+
         _, initial = initial_actions(x0, T=Tl, dt=dt)
         for j in range(0, T, Tstep):
             k = j + Tstep
-            states_j, actions_j = solve(states[j], initial=initial)
+            states_j, actions_j = solve(states[j], initial=initial, dt=dt,
+                                        atol=5e0, λ_base=3.0, ln_λ=-5,
+                                        ln_λ_max=20, iter_max=2000)
             states[j:k+1], actions[j:k] = states_j[:Tstep+1], actions_j[:Tstep]
             #filler = np.zeros((Tstep, *model.action_shape))
             #filler = initial_actions(states[k], T=Tstep, dt=dt).actions
             filler = np.repeat(actions_j[-1][None], Tstep, axis=0)
             #filler = np.random.uniform(u_lower, u_upper, size=(Tstep, *model.action_shape))
             initial = np.vstack((actions_j[Tstep:], filler))
+
         #states = model.step_array(x0, actions, dt=dt)
         log.info('x_final:\n%s', model.state_rep(states[-1]))
-        np.savez(f'ddp{i}.npz', actions=actions, states=states, dt=dt)
-        x0 = model.sample_states(1)[0]
+        optimizeds.append(traj.Trajectory(dt=dt, states=states, actions=actions))
+
+    traj.save_many('pid_trajs.npz', initials)
+    traj.save_many('ddp_trajs.npz', optimizeds)
 
 if __name__ == "__main__":
     main()

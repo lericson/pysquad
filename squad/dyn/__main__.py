@@ -55,7 +55,10 @@ def main(args=sys.argv[1:]):
     tracker = traj.Tracker()
     model = import_name(model_spec)()
     policy = import_name(policy_spec)()
-    policy.tracker = tracker.alt(color='g')
+    try:
+        policy.tracker = tracker.alt(color='g')
+    except Exception as e:
+        log.warn('could not set tracker attribute: %s', e)
     if init_state:
         x0 = np.array(list(map(eval, init_state)), dtype=np.float64)
     else:
