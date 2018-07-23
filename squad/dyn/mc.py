@@ -93,6 +93,17 @@ class Quad(ODEModel):
         return (f'[p: {px:+6.2e} {py:+6.2e} {pz:+6.2e}; R: {Rr:+6.2e} {Rp:+6.2e} {Ry:+6.2e}\n'
                 f' v: {vx:+6.2e} {vy:+6.2e} {vz:+6.2e}; w: {wx:+6.2e} {wy:+6.2e} {wz:+6.2e}]')
 
+class Quad2D(Quad):
+    from . import qf2d
+    x_dot = staticmethod(qf2d.x_dot)
+    step_eul = staticmethod(qf2d.step_eul)
+    step_array = staticmethod(qf2d.step_array)
+
+    #                     x  y  z qi qj qk qr vx vy vz wx wy wz w0 w1 w2 w3
+    x_sample_mean = np.r_[0, 0, 0, 0,.2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    x_sample_std  = np.r_[1, 0, 1, 0,.1, 0,.1, 2, 0, 2, 0,.1, 0, 0, 0, 0, 0]
+    state_dist = normal(x_sample_mean, x_sample_std)
+
 class QuadMix(Quad):
     action_shape = (4,)
     u_lower = np.r_[-1, -1, -1,  0]

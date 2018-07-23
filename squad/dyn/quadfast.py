@@ -7,7 +7,7 @@ from .. import quat
 from ..utis import env_param, polyval, cross
 
 # Common type definitions
-from numba.types import Tuple, optional, none
+from numba.types import Tuple, none
 StateT     = nb.float64[::1]
 ActionT    = nb.float64[::1]
 TimeDeltaT = nb.float64
@@ -15,6 +15,7 @@ StateArrayT  = nb.float64[:, ::1]
 ActionArrayT = nb.float64[:, ::1]
 DerivativesT = Tuple((StateArrayT, ActionArrayT))
 
+eps = 1e-9
 radius = 0.2  # m
 mass = 1.3  # kg
 num_rotors = 4
@@ -36,11 +37,13 @@ thrust_rpm_max = (mass + 5)*9.82
 thrust_coeffs = np.r_[+1.0942e-07, -2.1059e-04, 0.0]
 thrust_coeffs *= thrust_rpm_max/np.polyval(thrust_coeffs, rpm_max)
 z_torque_per_rpm = 5e-4/rpm_max
-eps = 1e-9
+
+(ipx, ipy, ipz, iqi, iqj, iqk, iqr, ivx, ivy, ivz, iwx, iwy, iwz, iw0, iw1,
+ iw2, iw3, imax) = range(13+num_rotors+1)
 
 num_substeps = env_param('num_substeps', default=2, cast=int)
 
-@nb.njit(StateT(TimeDeltaT, StateT, ActionT, StateT), cache=True, nogil=True)
+@nb.njit(none(TimeDeltaT, StateT, ActionT, StateT), cache=True, nogil=True)
 def x_dot_out(t, x, u, out):
     x[3:7] /= np.linalg.norm(x[3:7]) + eps
     attq, linvel, angvel, rpms = x[3:7], x[7:10], x[10:13], x[13:]
@@ -64,7 +67,6 @@ def x_dot_out(t, x, u, out):
     out[7:10]  = force_if/mass
     out[10:13] = torque/inertia
     out[13:]   = rotor_rpm_coeff*(u*rpm_max - x[13:])
-    return out
 
 @nb.njit(StateT(TimeDeltaT, StateT, ActionT), cache=True, nogil=True)
 def x_dot(t, x, u):
