@@ -38,13 +38,13 @@ python3 -m squad.dyn squad.dyn.mc.Quad squad.px4.Agent
 Same with the DDP-based trajectory optimizer
 
 ```sh
-python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.load_policy
+python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.make_quad_policy
 ```
 
 Visualization of trajectory optimization (recommended viewing, very satisfying)
 
 ```sh
-python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.load_policy
+python3 -m squad.dyn squad.dyn.mc.Quad squad.ddp.make_quad_policy
 ```
 
 ## FAQ

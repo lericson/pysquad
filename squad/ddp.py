@@ -10,58 +10,12 @@ from .dyn import mc
 from .utis import clip, env_param, qf
 #from models.pointmass import PointMass
 model = mc.Quad()
-make_policy = px4.Agent
 
 TrajTuple = namedtuple('TrajTuple', 'states actions')
 
 log = logging.getLogger(__name__)
 DT = env_param('dt', default=1/400, cast=float)
 Tl = env_param('ddp_lookahead', default=2000, cast=int)
-
-x_dot = model.x_dot
-step_eul = model.step_eul
-u_upper = model.u_upper
-u_lower = model.u_lower
-state_shape = model.state_shape
-action_shape = model.action_shape
-state_noise = 2e-7/DT
-action_noise = 2e-6/DT
-
-def initial_actions(x0, *, T, dt):
-    policy = make_policy()
-    U = np.empty((T, *model.action_shape))
-    X = np.empty((T+1, *model.state_shape))
-    #ε_u = np.random.normal(0.0, action_noise, size=U.shape)
-    #ε_x = np.random.normal(0.0, state_noise, size=X.shape)
-    X[0] = x0
-    for i in range(T):
-        U[i] = policy(X[i])
-        U[i] = clip(U[i], u_lower, u_upper)
-        X[i+1]  = X[i]
-        X[i+1] += dt*x_dot(0.0, X[i], U[i])
-    return TrajTuple(X, U)
-
-@nb.njit('f8[:](f8[:])', cache=True, nogil=True)
-def clip_action(u):
-    for i in range(action_shape[0]):
-        if u[i] < u_lower[i]:
-            u[i] = u_lower[i]
-        if u_upper[i] < u[i]:
-            u[i] = u_upper[i]
-    return u
-
-@nb.njit(cache=True, nogil=True)
-def forward_pass(K, k, X, U, dt):
-    X_new = np.empty_like(X)
-    U_new = np.empty_like(U)
-    #ε_x = np.random.normal(0.0, state_noise, size=X.shape)
-    #ε_u = np.random.normal(0.0, action_noise, size=U.shape)
-    X_new[0] = X[0]
-    for i in range(U.shape[0]):
-        U_new[i] = clip_action(U[i] + k[i] + K[i] @ (X_new[i] - X[i]))
-        X_new[i+1] = step_eul(X_new[i], U_new[i], dt=dt)
-        #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
-    return X_new, U_new
 
 @nb.njit(cache=True, nogil=True)
 def inv_reg(A, λ):
@@ -85,43 +39,10 @@ def inv_reg(A, λ):
 
     # Method 3: SVD, by far faster than eigendecomposition
     U, s, V = np.linalg.svd(A)
-    for j in range(action_shape[0]):
+    for j in range(A.shape[0]):
         s[j] = 1.0/(s[j] + λ)
         #s[j] = 1.0/(s[j] + λ**2/s[j] + eps)
     return U@(s*V)
-
-@nb.njit(cache=True, nogil=True)
-def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux, λ):
-    T = fx.shape[0]
-    Qx  = np.empty(state_shape)
-    Qu  = np.empty(action_shape)
-    Qxx = np.empty(state_shape + state_shape)
-    Quu = np.empty(action_shape + action_shape)
-    Qux = np.empty(action_shape + state_shape)
-    V_x  = V_x.copy()
-    V_xx = V_xx.copy()
-    for i in range(T-1, -1, -1):
-        # Calculate Qx, Qu, Qxx, Quu, Qxu.
-        np.dot(fx[i].T, V_x, out=Qx); Qx += lx[i]
-        np.dot(fu[i].T, V_x, out=Qu); Qu += lu[i]
-        fxTV_xx = np.dot(fx[i].T, V_xx)
-        fuTV_xx = np.dot(fu[i].T, V_xx)
-        np.dot(fxTV_xx, fx[i], out=Qxx); Qxx += lxx[i]
-        np.dot(fuTV_xx, fu[i], out=Quu); Quu += luu[i]
-        np.dot(fuTV_xx, fx[i], out=Qux); Qux += lux[i]
-
-        # Inversion of Quu. Very important stuff.
-        neg_Quu_inv  = inv_reg(Quu, λ)
-        neg_Quu_inv *= -1
-
-        # Compute k, K, Vx, Vxx.
-        np.dot(neg_Quu_inv, Qu,  out=k[i])
-        np.dot(neg_Quu_inv, Qux, out=K[i])
-        neg_KTQuu  = np.dot(K[i].T, Quu)
-        neg_KTQuu *= -1
-        np.dot(neg_KTQuu, k[i], out=V_x); V_x += Qx
-        np.dot(neg_KTQuu, K[i], out=V_xx); V_xx += Qxx
-    return K, k
 
 @nb.jitclass([('Qf', nb.float64[:, ::1]),
               ('Q', nb.float64[:, ::1]),
@@ -208,7 +129,178 @@ class NumericalDynamics():
 
         self.derivatives = derivatives
 
-def cost_matrices():
+def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
+         dynamics='analytical'):
+
+    step_eul = model.step_eul
+    u_upper = model.u_upper
+    u_lower = model.u_lower
+    state_shape = model.state_shape
+    action_shape = model.action_shape
+
+    def initial_traj(x0, *, T):
+        policy = initial()
+        U = np.empty((T,   *model.action_shape))
+        X = np.empty((T+1, *model.state_shape))
+        X[0] = x0
+        for i in range(T):
+            U[i] = policy(X[i])
+            U[i] = clip(U[i], model.u_lower, model.u_upper)
+            X[i+1]  = X[i]
+            X[i+1] += dt*model.x_dot(0.0, X[i], U[i])
+        return TrajTuple(X, U)
+
+    if dynamics == 'analytical':
+        dyn = model.derivatives
+    elif dynamics == 'numerical':
+        dyn = NumericalDynamics(model).derivatives
+    elif callable(dynamics):
+        dyn = dynamics
+    else:
+        raise ValueError(dynamics)
+
+    @nb.njit(cache=True, nogil=True)
+    def _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux):
+        T = U.shape[0]
+        V_x, V_xx = cost.final_derivatives(X[T], x_goal)
+        for i in range(T):
+            #fx[i], fu[i], _, _, _, _ = dyn(X[i], U[i], dt=dt)
+            #lx[i], lu[i], lxx[i], lxu[i], luu[i], lux[i] = cost.derivatives(X[i], U[i], x_goal)
+            dyn(X[i], U[i], dt, fx[i], fu[i])
+            cost.derivatives(X[i], U[i], x_goal, lx[i], lu[i], lxx[i], lxu[i], luu[i], lux[i])
+        return V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux
+
+    @nb.njit('f8[:](f8[:])', cache=True, nogil=True)
+    def clip_action(u):
+        for i in range(action_shape[0]):
+            if u[i] < u_lower[i]:
+                u[i] = u_lower[i]
+            if u_upper[i] < u[i]:
+                u[i] = u_upper[i]
+        return u
+
+    @nb.njit(cache=True, nogil=True)
+    def forward_pass(K, k, X, U):
+        X_new = np.empty_like(X)
+        U_new = np.empty_like(U)
+        X_new[0] = X[0]
+        for i in range(U.shape[0]):
+            U_new[i] = clip_action(U[i] + k[i] + K[i] @ (X_new[i] - X[i]))
+            X_new[i+1] = step_eul(X_new[i], U_new[i], dt=dt)
+            #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
+        return X_new, U_new
+
+    @nb.njit(cache=True, nogil=True)
+    def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux, λ):
+        T = fx.shape[0]
+        Qx  = np.empty(state_shape)
+        Qu  = np.empty(action_shape)
+        Qxx = np.empty(state_shape + state_shape)
+        Quu = np.empty(action_shape + action_shape)
+        Qux = np.empty(action_shape + state_shape)
+        V_x  = V_x.copy()
+        V_xx = V_xx.copy()
+        for i in range(T-1, -1, -1):
+            # Calculate Qx, Qu, Qxx, Quu, Qxu.
+            np.dot(fx[i].T, V_x, out=Qx); Qx += lx[i]
+            np.dot(fu[i].T, V_x, out=Qu); Qu += lu[i]
+            fxTV_xx = np.dot(fx[i].T, V_xx)
+            fuTV_xx = np.dot(fu[i].T, V_xx)
+            np.dot(fxTV_xx, fx[i], out=Qxx); Qxx += lxx[i]
+            np.dot(fuTV_xx, fu[i], out=Quu); Quu += luu[i]
+            np.dot(fuTV_xx, fx[i], out=Qux); Qux += lux[i]
+
+            # Inversion of Quu. Very important stuff.
+            neg_Quu_inv  = inv_reg(Quu, λ)
+            neg_Quu_inv *= -1
+
+            # Compute k, K, Vx, Vxx.
+            np.dot(neg_Quu_inv, Qu,  out=k[i])
+            np.dot(neg_Quu_inv, Qux, out=K[i])
+            neg_KTQuu  = np.dot(K[i].T, Quu)
+            neg_KTQuu *= -1
+            np.dot(neg_KTQuu, k[i], out=V_x); V_x += Qx
+            np.dot(neg_KTQuu, K[i], out=V_xx); V_xx += Qxx
+        return K, k
+
+    #@nb.njit(cache=True, nogil=True)
+    def ddp(x0, x_goal, U, ln_λ=-5, ln_λ_max=55, λ_base=1.5,
+            iter_max=2000, atol=5e-1, callback=None, return_controllers=False):
+        t0     = time.time()
+        T      = U.shape[0]
+        X      = model.step_array(x0, U, dt=dt)
+        k_new  = np.empty((T,) + action_shape)
+        K_new  = np.empty((T,) + action_shape + state_shape)
+        fx     = np.empty((T,) + state_shape + state_shape)
+        fu     = np.empty((T,) + state_shape + action_shape)
+        lx     = np.empty((T,) + state_shape)
+        lu     = np.empty((T,) + action_shape)
+        lxx    = np.empty((T,) + state_shape + state_shape)
+        lxu    = np.empty((T,) + state_shape + action_shape)
+        luu    = np.empty((T,) + action_shape + action_shape)
+        lux    = np.empty((T,) + action_shape + state_shape)
+        c      = cost.trajectory(X, U, x_goal)
+        c_init = c
+        derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
+        n_updt = 0
+
+        if callback is not None:
+            callback(U)
+
+        ln_λ_start = ln_λ
+        line_search_failed = True
+        for i in range(iter_max):
+            #if not all(np.all(np.isfinite(d)) for d in derivs):
+            #    log.warn('non-finite derivatives:\n%s', derivs)
+            try:
+                backward_pass(K_new, k_new, *derivs, λ_base**ln_λ)
+            except np.linalg.LinAlgError as e:
+                #log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
+                ln_λ += 1
+                continue
+            X_new, U_new = forward_pass(K_new, k_new, X, U)
+            c_new = cost.trajectory(X_new, U_new, x_goal)
+            change = c - c_new
+            if change > atol or (change > 0 and n_updt == 0):
+                log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
+                c, X, U, K, k = c_new, X_new, U_new, K_new.copy(), k_new.copy()
+                derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
+                n_updt += 1
+                ln_λ -= 1
+                line_search_failed = False
+                if callback is not None:
+                    callback(U)
+            else:
+                #log.debug('rej, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
+                ln_λ += 1
+                if ln_λ > ln_λ_max:
+                    if line_search_failed:
+                        break
+                    log.debug('resetting λ')
+                    ln_λ = ln_λ_start
+                    line_search_failed = True
+
+        t1 = time.time()
+        log.info('ddp done. %2d upd %3d iters %5.3g s, c_init: %.5g, c: %.5g, %%ch: %.5g',
+                 n_updt, i, t1 - t0, c_init, c, (c_init - c)/abs(c_init))
+        trj = TrajTuple(X, U)
+
+        if return_controllers:
+            return trj, K, k
+        else:
+            return trj
+
+    def solver(x0, *, initial=None, **kw):
+        assert ((initial is None) ^ (T is None)) or (initial.shape[0] == T)
+        if initial is None:
+            _, initial = initial_traj(x0, T=T)
+        return ddp(x0, x_goal, initial, **kw)
+
+    solver.initial_traj = initial_traj
+    solver.forward_pass = forward_pass
+    return solver
+
+def make_quad(**kw):
     ipx, ipy, ipz, iqi, iqj, iqk, iqr, ivx, ivy, ivz, iwx, iwy, iwz, irpm = range(14)
     Qf = np.zeros(model.state_shape)
     Qf[ipx] = Qf[ipy] = 4e1
@@ -243,173 +335,95 @@ def cost_matrices():
     #R = 0*np.eye(*model.action_shape)
     R = np.diag(1e-3*np.ones(*model.action_shape))
 
-    return Qf, Q, R
-
-def load(dt=None, T=None, dynamics='analytical', initial_actions=initial_actions):
-    Qf, Q, R = cost_matrices()
-    #cost = QuadraticCost(Qf, Q, R)
-    #dyn = SymQuadDynamics()
-    #dyn = ADQuadDynamics().derivatives
-    #dyn = model.derivatives
-    if dynamics == 'analytical':
-        dyn = model.derivatives
-    elif dynamics == 'numerical':
-        dyn = NumericalDynamics(model).derivatives
-
     # NOTE attq for the goal is zeroed!
     x_goal = 0.0*model.state(position=(0, 0, 0))
 
-    @nb.njit(cache=True, nogil=True)
-    def _calc_derivatives(cost, X, U, x_goal, dt, fx, fu, lx, lu, lxx, lxu, luu, lux):
-        T = U.shape[0]
-        V_x, V_xx = cost.final_derivatives(X[T], x_goal)
-        for i in range(T):
-            #fx[i], fu[i], _, _, _, _ = dyn(X[i], U[i], dt=dt)
-            #lx[i], lu[i], lxx[i], lxu[i], luu[i], lux[i] = cost.derivatives(X[i], U[i], x_goal)
-            dyn(X[i], U[i], dt, fx[i], fu[i])
-            cost.derivatives(X[i], U[i], x_goal, lx[i], lu[i], lxx[i], lxu[i], luu[i], lux[i])
-        return V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux
+    cost = QuadraticCost(Qf=Qf, Q=Q, R=R)
+    solver = make(model=model, cost=cost, initial=px4.Agent, x_goal=x_goal, **kw)
+    solver.cost_matrices = Qf, Q, R
+    return solver
 
-    #@nb.njit(cache=True, nogil=True)
-    def ddp(x0, x_goal, U, dt, ln_λ=-5, ln_λ_max=55, λ_base=1.5,
-            iter_max=2000, atol=5e-1, callback=None, return_controllers=False):
-        t0     = time.time()
-        T      = U.shape[0]
-        X      = model.step_array(x0, U, dt=dt)
-        k_new  = np.empty((T,) + action_shape)
-        K_new  = np.empty((T,) + action_shape + state_shape)
-        fx     = np.empty((T,) + state_shape + state_shape)
-        fu     = np.empty((T,) + state_shape + action_shape)
-        lx     = np.empty((T,) + state_shape)
-        lu     = np.empty((T,) + action_shape)
-        lxx    = np.empty((T,) + state_shape + state_shape)
-        lxu    = np.empty((T,) + state_shape + action_shape)
-        luu    = np.empty((T,) + action_shape + action_shape)
-        lux    = np.empty((T,) + action_shape + state_shape)
-        cost   = QuadraticCost(Qf, Q, R)
-        c      = cost.trajectory(X, U, x_goal)
-        c_init = c
-        derivs = _calc_derivatives(cost, X, U, x_goal, dt, fx, fu, lx, lu, lxx, lxu, luu, lux)
-        n_updt = 0
-
-        if callback is not None:
-            callback(U)
-
-        ln_λ_start = ln_λ
-        line_search_failed = True
-        for i in range(iter_max):
-            #if not all(np.all(np.isfinite(d)) for d in derivs):
-            #    log.warn('non-finite derivatives:\n%s', derivs)
-            try:
-                backward_pass(K_new, k_new, *derivs, λ_base**ln_λ)
-            except np.linalg.LinAlgError as e:
-                #log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
-                ln_λ += 1
-                continue
-            X_new, U_new = forward_pass(K_new, k_new, X, U, dt=dt)
-            c_new = cost.trajectory(X_new, U_new, x_goal)
-            change = c - c_new
-            if change > atol or (change > 0 and n_updt == 0):
-                log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
-                c, X, U, K, k = c_new, X_new, U_new, K_new.copy(), k_new.copy()
-                derivs = _calc_derivatives(cost, X, U, x_goal, dt, fx, fu, lx, lu, lxx, lxu, luu, lux)
-                n_updt += 1
-                ln_λ -= 1
-                line_search_failed = False
-                if callback is not None:
-                    callback(U)
-            else:
-                #log.debug('rej, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
-                ln_λ += 1
-                if ln_λ > ln_λ_max:
-                    if line_search_failed:
-                        break
-                    log.debug('resetting λ')
-                    ln_λ = ln_λ_start
-                    line_search_failed = True
-
-        t1 = time.time()
-        log.info('ddp done. %2d upd %3d iters %5.3g s, c_init: %.5g, c: %.5g, %%ch: %.5g',
-                 n_updt, i, t1 - t0, c_init, c, (c_init - c)/abs(c_init))
-        trj = TrajTuple(X, U)
-
-        if return_controllers:
-            return trj, K, k
-        else:
-            return trj
-
-    def solve(x0, *, initial=None, dt=dt, T=T, **kw):
-        assert dt is not None
-        assert ((initial is None) ^ (T is None)) or (initial.shape[0] == T)
-        if initial is None:
-            _, initial = initial_actions(x0, T=T, dt=dt)
-        return ddp(x0, x_goal, initial, dt=dt, **kw)
-    return solve
-
-def load_policy(T=Tl, dt=DT, tolerance=2e0):
-    solve = load(T=T, dt=dt)
+def make_quad_policy(*, dt=DT, T=Tl, tolerance=2e0, **kw):
+    solver = make_quad(dt=dt, T=T, **kw)
+    Qf, Q, R = solver.cost_matrices
     X, U, Ks, ks, th, t = None, None, None, None, None, 0
-    Qf, Q, R = cost_matrices()
+
     import threading
     lock = threading.Lock()
+
     def cb(x0, U):
         if hasattr(action, 'tracker'):
             action.tracker.set_trajectory(TrajTuple(model.step_array(x0, U, dt), U))
+
     def action(x0):
         nonlocal X, U, Ks, ks, th, t
+
         q = qf(Q, (X[t] - x0)) if X is not None else np.inf
+
         if q < tolerance:
             dists = np.linalg.norm(X[t:t+10, 0:3] - x0[0:3], axis=1)
             t = t + dists.argmin()
-            #log.debug('using linear control t=%d', t)
-            X[t]=x0
-            #X = model.step_array(X[0], U, dt)
-            X[t:], U[t:] = forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:], dt)
-            #u = clip_action(U[t] + Ks[t] @ (X[t] - x0))
-            if X.shape[0] < 5:
-                X = None
+
+            # Re-run controllers from x_t
+            with lock:
+                X[t] = x0
+                X[t:], U[t:] = solver.forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:])
+
+                if X.shape[0] < 5:
+                    X = None
+
             if th is None or not th.is_alive():
                 #X, U, Ks, ks, t = X[t:], U[t:], Ks[t:], ks[t:], 0
                 th = threading.Thread(target=update, args=(t+100,))
                 th.start()
+
             return U[t]
-        if X is not None:
-            log.warn('ran out of controls mid-flight, stopping time')
-        log.info('optimizing trajectory')
-        if th is not None:
-            th.join()
-        (X, U), Ks, ks = solve(x0, initial=None, dt=dt, callback=lambda U: cb(x0, U),
-                               atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
-                               iter_max=50, return_controllers=True)
-        t = 0
-        return U[t]
-        #states, actions = solve(x0, initial=U, atol=1e-2)
+
+        else:
+            if X is not None:
+                log.warn('re-optimizing trajectory mid-flight!')
+            else:
+                log.info('optimizing trajectory')
+
+            # Throw away current update step, as it is irrelevant anyway.
+            if th is not None:
+                th.join()
+
+            (X, U), Ks, ks = solver(x0, initial=None, callback=lambda U: cb(x0, U),
+                                    atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
+                                    iter_max=50, return_controllers=True)
+            t = 0
+            return U[t]
+
     def update(n):
         "Update current trajectory estimate from point n."
         nonlocal X, U, Ks, ks
+
+        # New set of actions U_ is an extension of U into the future.
         U_ = U
         if U_ is not None:
             U_ = U_[n:][:T]
-            # TODO Fill in using K
             filler = np.repeat(U_[-1][None], T-U_.shape[0], axis=0)
             U_ = np.vstack((U_, filler))
-        trj, Ks_, ks_ = solve(X[n], initial=U_, dt=dt, callback=lambda U: cb(X[n], U),
-                              atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
-                              iter_max=50, return_controllers=True)
+
+        trj, Ks_, ks_ = solver(X[n], initial=U_, callback=lambda U: cb(X[n], U),
+                               atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
+                               iter_max=50, return_controllers=True)
+
+        # Safely update shared variables
         with lock:
             X = np.vstack((X[:n], trj.states))
             U = np.vstack((U[:n], trj.actions))
             Ks = np.vstack((Ks[:n], Ks_))
             ks = np.vstack((ks[:n], ks_))
-        #X = np.vstack((trj.states[1:],  trj.states[-1]))
-        #U = np.vstack((trj.actions[1:], trj.actions[-1]))
+
     return action
 
 def main(dt=DT, T=Tl, Tl=Tl, Tstep=Tl, n=10):
     import logcolor
     logcolor.basic_config(level=logging.DEBUG)
 
-    solve = load(T=Tl, dt=dt)
+    solver = make_quad(dt=dt, T=T)
 
     initials = []
     optimizeds = []
@@ -417,18 +431,18 @@ def main(dt=DT, T=Tl, Tl=Tl, Tstep=Tl, n=10):
     for i, x0 in enumerate(model.sample_states(n)):
         log.info('sample %d, x0:\n%s', i, model.state_rep(x0))
 
-        states, actions = initial_actions(x0, T=T, dt=dt)
+        states, actions = solver.initial_traj(x0, T=T)
         initials.append(traj.Trajectory(dt=dt, states=states.copy(), actions=actions.copy()))
 
-        _, initial = initial_actions(x0, T=Tl, dt=dt)
+        initial = solver.initial_traj(x0, T=Tl).actions
         for j in range(0, T, Tstep):
             k = j + Tstep
-            states_j, actions_j = solve(states[j], initial=initial, dt=dt,
-                                        atol=5e0, λ_base=3.0, ln_λ=-5,
-                                        ln_λ_max=20, iter_max=2000)
+            states_j, actions_j = solver(states[j], initial=initial,
+                                         atol=5e0, λ_base=3.0, ln_λ=-5,
+                                         ln_λ_max=20, iter_max=2000)
             states[j:k+1], actions[j:k] = states_j[:Tstep+1], actions_j[:Tstep]
             #filler = np.zeros((Tstep, *model.action_shape))
-            #filler = initial_actions(states[k], T=Tstep, dt=dt).actions
+            #filler = solver.initial_traj(states[k], T=Tstep).actions
             filler = np.repeat(actions_j[-1][None], Tstep, axis=0)
             #filler = np.random.uniform(u_lower, u_upper, size=(Tstep, *model.action_shape))
             initial = np.vstack((actions_j[Tstep:], filler))

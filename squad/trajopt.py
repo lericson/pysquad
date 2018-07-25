@@ -57,7 +57,7 @@ def make(*, model=model, n=NUM_LOOKAHEAD, dt=DT,
             t, X, U, R = model.steps(x0, policy, steps=n, dt=dt)
             return TrajTuple(X, U)
 
-    ddp_solve = ddp.load(dynamics=dynamics)
+    ddp_solve = ddp.make_quad(dynamics=dynamics)
 
     state_shape = model.state_shape
     action_shape = model.action_shape
