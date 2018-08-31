@@ -4,6 +4,7 @@ import OpenGL.GL.framebufferobjects as glfbo
 import numpy as np
 from pyqtgraph import Vector, functions as fn
 
+from .utis import env_param
 ##Vector = QtGui.QVector3D
 
 ShareWidget = None
@@ -16,6 +17,8 @@ class GLViewWidget(QtOpenGL.QGLWidget):
         - Export options
 
     """
+
+    projection = env_param('projection', default='perspective', cast=str)
 
     def __init__(self, parent=None):
         global ShareWidget
@@ -37,10 +40,11 @@ class GLViewWidget(QtOpenGL.QGLWidget):
                                       ## (rotation around z-axis 0 points along x-axis)
             'viewport': None,         ## glViewport params; None == whole widget
         }
+        self.setHome()
         self.setBackgroundColor('k')
         self.items = []
-        self.noRepeatKeys = [QtCore.Qt.Key_Right, QtCore.Qt.Key_Left, QtCore.Qt.Key_Up, QtCore.Qt.Key_Down, QtCore.Qt.Key_H, QtCore.Qt.Key_PageUp, QtCore.Qt.Key_PageDown]
-        self.keysPressed = {}
+        self.noRepeatKeys = [QtCore.Qt.Key_Right, QtCore.Qt.Key_Left, QtCore.Qt.Key_Up, QtCore.Qt.Key_Down, QtCore.Qt.Key_H, QtCore.Qt.Key_P, QtCore.Qt.Key_PageUp, QtCore.Qt.Key_PageDown]
+        self.keysPressed = set()
         self.keyTimer = QtCore.QTimer()
         self.keyTimer.timeout.connect(self.evalKeyState)
         
@@ -64,6 +68,13 @@ class GLViewWidget(QtOpenGL.QGLWidget):
         item._setView(None)
         self.update()
         
+    def setHome(self):
+        """
+        Set current camera to home view.
+        """
+        keys = {'center', 'distance', 'fov', 'elevation', 'azimuth'}
+        self.opts['home'] = {k: self.opts[k] for k in keys}
+
     def setBackgroundColor(self, *args, **kwds):
         """
         Set the background color of the widget. Accepts the same arguments as
@@ -71,7 +82,7 @@ class GLViewWidget(QtOpenGL.QGLWidget):
         """
         self.opts['bgcolor'] = fn.glColor(*args, **kwds)
         self.update()
-        
+
     def getViewport(self):
         vp = self.opts['viewport']
         if vp is None:
@@ -109,7 +120,13 @@ class GLViewWidget(QtOpenGL.QGLWidget):
         top    = t * ((region[1]+region[3]-y0) * (2.0/h) - 1)
 
         tr = QtGui.QMatrix4x4()
-        tr.frustum(left, right, bottom, top, nearClip, farClip)
+        if self.projection == 'perspective':
+            tr.frustum(left, right, bottom, top, nearClip, farClip)
+        elif self.projection == 'orthographic':
+            tr.ortho(left, right, bottom, top, nearClip, farClip)
+        else:
+            raise ValueError(self.projection)
+
         return tr
         
     def setModelview(self):
@@ -340,7 +357,7 @@ class GLViewWidget(QtOpenGL.QGLWidget):
             ev.accept()
             if ev.isAutoRepeat():
                 return
-            self.keysPressed[ev.key()] = 1
+            self.keysPressed.add(ev.key())
             self.evalKeyState()
       
     def keyReleaseEvent(self, ev):
@@ -348,15 +365,12 @@ class GLViewWidget(QtOpenGL.QGLWidget):
             ev.accept()
             if ev.isAutoRepeat():
                 return
-            try:
-                del self.keysPressed[ev.key()]
-            except:
-                self.keysPressed = {}
+            self.keysPressed.discard(ev.key())
             self.evalKeyState()
         
     def evalKeyState(self):
         speed = 2.0
-        if len(self.keysPressed) > 0:
+        if self.keysPressed:
             for key in self.keysPressed:
                 if key == QtCore.Qt.Key_Right:
                     self.orbit(azim=-speed, elev=0)
@@ -367,12 +381,20 @@ class GLViewWidget(QtOpenGL.QGLWidget):
                 elif key == QtCore.Qt.Key_Down:
                     self.orbit(azim=0, elev=speed)
                 elif key == QtCore.Qt.Key_H:
-                    self.pan(0, 0, 0, relative=False)
-                    self.opts['distance'] = 10.0
+                    self.opts.update(self.opts['home'])
+                    self.update()
+                elif key == QtCore.Qt.Key_P:
+                    self.keysPressed.discard(key)
+                    m = {'perspective':  'orthographic',
+                         'orthographic': 'perspective'}
+                    self.projection = m[self.projection]
+                    self.update()
                 elif key == QtCore.Qt.Key_PageUp:
-                    pass
+                    self.opts['distance'] *= 0.99**speed
+                    #self.pan(speed, speed, 0, relative=True)
                 elif key == QtCore.Qt.Key_PageDown:
-                    pass
+                    self.opts['distance'] /= 0.99**speed
+                    #self.pan(-speed, -speed, 0, relative=True)
                 self.keyTimer.start(16)
         else:
             self.keyTimer.stop()

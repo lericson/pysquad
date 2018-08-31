@@ -1,6 +1,6 @@
 import time
 import logging
-from collections import namedtuple
+import threading
 
 import numpy as np
 import numba as nb
@@ -9,40 +9,65 @@ from . import px4, traj
 from .dyn import mc
 from .utis import clip, env_param, qf
 #from models.pointmass import PointMass
-model = mc.Quad()
 
-TrajTuple = namedtuple('TrajTuple', 'states actions')
+class Solution(traj.Trajectory):
+    max_jump_steps = 10
+    max_state_error = 2e1
+
+    def sample(self, *, n, sigma2):
+        # Future work: sample trajectories simultaneously by replacing the
+        # state and action vectors by matrices.
+        return [self._sample_one(sigma2) for i in range(n)]
+
+    def rerun(self, *, state=None, start=0):
+        "Re-run controllers from time step *start*."
+        if state is not None:
+            self.states[start] = state
+        return self._sample_one(start=start)
+
+    def _sample_one(self, sigma2=0.0, start=0, warn=True):
+        X_new = np.empty_like(self.states)
+        U_new = np.empty_like(self.actions)
+        X_new[start] = self.states[start]
+        for i in range(start, self.actions.shape[0]):
+            error = np.linalg.norm(self.states[i, 0:3] - X_new[i, 0:3])
+            if warn and error > self.max_state_error:
+                warn = False
+                log.warn('position deviates from reference trajectory '
+                         '(%.3g), control likely nonsensical', error)
+            xi, ui = self.states[i], self.actions[i]
+            Ki, ki = self.controllers[i]
+            ui_new = ui + ki + Ki @ (X_new[i] - xi)
+            U_new[i] = self._clip_action(ui_new)
+            if sigma2 > 0.0:
+                ui_new = np.random.normal(ui_new, sigma2)
+            ui_new = self._clip_action(ui_new)
+            X_new[i+1] = self.model.step_eul(X_new[i], ui_new, dt=self.dt)
+            #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
+        trj = traj.Trajectory(dt=self.dt, states=X_new, actions=U_new)
+        trj.cost = self._costf.trajectory(X_new, U_new, self._x_goal)
+        return trj
+
+    def _sample_one_old(self, sigma2=0.0, start=0):
+        X_new = np.empty_like(self.states)
+        U_new = np.empty_like(self.actions)
+        X_new[0] = self.states[0]
+        for i in range(self.actions.shape[0]):
+            Ki, ki = self.controllers[i]
+            U_new[i] = self.actions[i] + ki + Ki @ (X_new[i] - self.states[i])
+            if sigma2 > 0.0:
+                U_new[i] = np.random.normal(U_new[i], sigma2)
+            U_new[i] = self._clip_action(U_new[i])
+            X_new[i+1] = self.model.step_eul(X_new[i], U_new[i], dt=self.dt)
+            #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
+        return traj.Trajectory(dt=self.dt, states=X_new, actions=U_new)
+
+    def _clip_action(self, u):
+        return np.clip(u, self.model.u_lower, self.model.u_upper)
 
 log = logging.getLogger(__name__)
 DT = env_param('dt', default=1/400, cast=float)
 Tl = env_param('ddp_lookahead', default=2000, cast=int)
-
-@nb.njit(cache=True, nogil=True)
-def inv_reg(A, λ):
-    "Regularized inversion of A."
-    # Method 1: plain old inversion.
-    # Variant 1a: plain old inversion.
-    #A_reg = A.copy()
-    #for j in range(A.shape[0]):
-    #    A_reg += λ
-    #    A_reg += λ*A[j, j]
-    #return np.linalg.inv(reg)
-
-    # Method 2: eigendecomposition
-    #eigvals, eigvecs = np.linalg.eig(A.astype(np.complex128))
-    #eigvals[eigvals.real < 1e-9] = 0.0
-    #eigvals[eigvals.imag != 0.0] = 0.0
-    #eigvals  += λ
-    #eigvalinv = np.diag(1.0/eigvals)
-    #A_inv   = (eigvecs @ eigvalinv @ eigvecs.T).real
-    #return A_inv
-
-    # Method 3: SVD, by far faster than eigendecomposition
-    U, s, V = np.linalg.svd(A)
-    for j in range(A.shape[0]):
-        s[j] = 1.0/(s[j] + λ)
-        #s[j] = 1.0/(s[j] + λ**2/s[j] + eps)
-    return U@(s*V)
 
 @nb.jitclass([('Qf', nb.float64[:, ::1]),
               ('Q', nb.float64[:, ::1]),
@@ -145,10 +170,9 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
         X[0] = x0
         for i in range(T):
             U[i] = policy(X[i])
-            U[i] = clip(U[i], model.u_lower, model.u_upper)
-            X[i+1]  = X[i]
-            X[i+1] += dt*model.x_dot(0.0, X[i], U[i])
-        return TrajTuple(X, U)
+            U[i] = clip_action(U[i])
+            X[i+1] = step_eul(X[i], U[i], dt=dt)
+        return traj.Trajectory(dt=dt, states=X, actions=U)
 
     if dynamics == 'analytical':
         dyn = model.derivatives
@@ -191,13 +215,17 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
         return X_new, U_new
 
     @nb.njit(cache=True, nogil=True)
-    def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux, λ):
+    def is_finite(a):
+        for i in range(a.shape[0]):
+            for j in range(a.shape[1]):
+                if not np.isfinite(a[i, j]):
+                    return False
+        return True
+
+    @nb.njit(cache=True, nogil=True)
+    def backward_pass(K, k, V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux,
+                      Qx, Qu, Qxx, Quu, Qux, λ):
         T = fx.shape[0]
-        Qx  = np.empty(state_shape)
-        Qu  = np.empty(action_shape)
-        Qxx = np.empty(state_shape + state_shape)
-        Quu = np.empty(action_shape + action_shape)
-        Qux = np.empty(action_shape + state_shape)
         V_x  = V_x.copy()
         V_xx = V_xx.copy()
         for i in range(T-1, -1, -1):
@@ -210,9 +238,17 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             np.dot(fuTV_xx, fu[i], out=Quu); Quu += luu[i]
             np.dot(fuTV_xx, fx[i], out=Qux); Qux += lux[i]
 
+            # Manually check for infinities, because if this happens inside of
+            # the Numba wrapper of numpy.linalg.svd, then memory is leaked.
+            if not is_finite(Quu):
+                raise np.linalg.LinAlgError('Quu has become infinite')
+
             # Inversion of Quu. Very important stuff.
-            neg_Quu_inv  = inv_reg(Quu, λ)
-            neg_Quu_inv *= -1
+            U, s, V = np.linalg.svd(Quu, full_matrices=False)
+            for j in range(Quu.shape[0]):
+                s[j] = 1.0/(s[j] + λ)
+                #s[j] = 1.0/(s[j] + λ**2/s[j] + eps)
+            neg_Quu_inv = -U@(s*V)
 
             # Compute k, K, Vx, Vxx.
             np.dot(neg_Quu_inv, Qu,  out=k[i])
@@ -221,11 +257,10 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             neg_KTQuu *= -1
             np.dot(neg_KTQuu, k[i], out=V_x); V_x += Qx
             np.dot(neg_KTQuu, K[i], out=V_xx); V_xx += Qxx
-        return K, k
 
     #@nb.njit(cache=True, nogil=True)
     def ddp(x0, x_goal, U, ln_λ=-5, ln_λ_max=55, λ_base=1.5,
-            iter_max=2000, atol=5e-1, callback=None, return_controllers=False):
+            iter_max=1000, atol=5e-1, callback=None, require_convergence=True):
         t0     = time.time()
         T      = U.shape[0]
         X      = model.step_array(x0, U, dt=dt)
@@ -239,13 +274,18 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
         lxu    = np.empty((T,) + state_shape + action_shape)
         luu    = np.empty((T,) + action_shape + action_shape)
         lux    = np.empty((T,) + action_shape + state_shape)
+        Qx     = np.empty(state_shape)
+        Qu     = np.empty(action_shape)
+        Qxx    = np.empty(state_shape + state_shape)
+        Quu    = np.empty(action_shape + action_shape)
+        Qux    = np.empty(action_shape + state_shape)
         c      = cost.trajectory(X, U, x_goal)
         c_init = c
         derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
         n_updt = 0
 
         if callback is not None:
-            callback(U)
+            callback(X, U)
 
         ln_λ_start = ln_λ
         line_search_failed = True
@@ -253,7 +293,8 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             #if not all(np.all(np.isfinite(d)) for d in derivs):
             #    log.warn('non-finite derivatives:\n%s', derivs)
             try:
-                backward_pass(K_new, k_new, *derivs, λ_base**ln_λ)
+                backward_pass(K_new, k_new, *derivs, Qx, Qu, Qxx, Quu, Qux,
+                              λ_base**ln_λ)
             except np.linalg.LinAlgError as e:
                 #log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
                 ln_λ += 1
@@ -263,13 +304,14 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             change = c - c_new
             if change > atol or (change > 0 and n_updt == 0):
                 log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
+                X_ref, U_ref = X, U
                 c, X, U, K, k = c_new, X_new, U_new, K_new.copy(), k_new.copy()
                 derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
                 n_updt += 1
                 ln_λ -= 1
                 line_search_failed = False
                 if callback is not None:
-                    callback(U)
+                    callback(X, U)
             else:
                 #log.debug('rej, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
                 ln_λ += 1
@@ -279,33 +321,46 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
                     log.debug('resetting λ')
                     ln_λ = ln_λ_start
                     line_search_failed = True
+        else:
+            if require_convergence:
+                raise ValueError(f'no convergence in {i} iterations')
+
+        if n_updt == 0:
+            raise ValueError('line search for regularization term failed')
 
         t1 = time.time()
         log.info('ddp done. %2d upd %3d iters %5.3g s, c_init: %.5g, c: %.5g, %%ch: %.5g',
                  n_updt, i, t1 - t0, c_init, c, (c_init - c)/abs(c_init))
-        trj = TrajTuple(X, U)
 
-        if return_controllers:
-            return trj, K, k
-        else:
-            return trj
+        trj = Solution(dt=dt, states=X_ref, actions=U_ref)
+        trj._costf = cost
+        trj._x_goal = x_goal
+        trj.cost = c
+        trj.model = model
+        trj.controllers = list(zip(K, k))
+        return trj
 
     def solver(x0, *, initial=None, **kw):
-        assert ((initial is None) ^ (T is None)) or (initial.shape[0] == T)
         if initial is None:
-            _, initial = initial_traj(x0, T=T)
+            initial = initial_traj(x0, T=T).actions
         return ddp(x0, x_goal, initial, **kw)
 
     solver.initial_traj = initial_traj
     solver.forward_pass = forward_pass
+    solver.x_goal = x_goal
+    solver.dt = dt
+    solver.T = T
     return solver
 
-def make_quad(**kw):
+def make_quad(*, model=None, **kw):
+    if model is None:
+        model = mc.Quad()
+
     ipx, ipy, ipz, iqi, iqj, iqk, iqr, ivx, ivy, ivz, iwx, iwy, iwz, irpm = range(14)
     Qf = np.zeros(model.state_shape)
     Qf[ipx] = Qf[ipy] = 4e1
     Qf[ipz]           = 5e1
-    Qf[ivx:ivz+1] = 2e1
+    Qf[ivx:ivz+1] = 1e1
     Qf[iwx:iwz+1] = 5e0
 
     # RPMs should be low since rpm^2 is the power usage. Bit too hard to
@@ -314,7 +369,7 @@ def make_quad(**kw):
 
     # Here L is the sum of projections of body axes onto inertial frame, plus
     # extra for Z.
-    q_axis_x, q_axis_y, q_axis_z = 6e0, 6e0, 1e1
+    q_axis_x, q_axis_y, q_axis_z = 3e0, 3e0, 5e0
     Qf[iqi] = -q_axis_x + q_axis_y + q_axis_z
     Qf[iqj] = +q_axis_x - q_axis_y + q_axis_z
     Qf[iqk] = +q_axis_x + q_axis_y - q_axis_z
@@ -341,89 +396,117 @@ def make_quad(**kw):
     cost = QuadraticCost(Qf=Qf, Q=Q, R=R)
     solver = make(model=model, cost=cost, initial=px4.Agent, x_goal=x_goal, **kw)
     solver.cost_matrices = Qf, Q, R
+    solver.cost = cost
+    solver.model = model
     return solver
+
+class LinearTodayPolicy():
+    # How many timesteps into the future to start optimization. A too low value
+    # means the optimizer will never finish before its result is needed. A too
+    # high value means the result is so far into the future that it's not
+    # certain the result will ever be useful. Ideally it should be just enough
+    # that the result is done a little before it's used.
+    num_optimize_ahead = 100
+
+    # Force re-optimization of trajectory if only this many controllers left.
+    # This isn't something that should happen, but if the optimization takes
+    # too long, it might.
+    num_controllers_min = 5
+
+    # How many future states to measure distance to. Solely for optimization.
+    max_time_jump = 10
+
+    def __init__(self, *, tolerance, solver):
+        self.solver = solver
+        self.tolerance = tolerance
+        self.lock = threading.Lock()
+        _, self.Q, _ = solver.cost_matrices
+        self.sol = None
+        self.tracker = None
+        self._update_thread = None
+        self.t = 0
+
+    def _cb(self, trj):
+        if self.tracker is not None:
+            self.tracker.set_trajectory(trj)
+
+    def __call__(self, x0):
+        q = qf(self.Q, (self.sol.states[self.t] - x0)) if self.sol is not None else np.inf
+
+        if q < self.tolerance:
+            return self._local_control(x0)
+        else:
+            return self._traj_opt(x0)
+
+    def _local_control(self, x0):
+        next_states = self.sol.states[self.t:self.t+self.max_time_jump]
+        dists = np.linalg.norm(next_states[:, 0:3] - x0[0:3], axis=1)
+        self.t += dists.argmin()
+
+        # Re-run controllers from x_t. At a first glance, it might seem as if
+        # we would only need to calculate the action for this time step;
+        # however, if there have been deviations, our re-optimization needs to
+        # start from a state that we will actually (probably) end up in, or
+        # close to. Thus we recompute the remainder of the current trajectory.
+        with self.lock:
+            self.sol = self.sol.rerun(state=x0, start=self.t)
+
+        action = self.sol.actions[self.t]
+
+        if len(self.sol.controllers[self.t:]) < self.num_controllers_min:
+            self.sol = None
+
+        if self._update_thread is None or not self._update_thread.is_alive():
+            self._update_thread = threading.Thread(target=self._update,
+                                                   args=(self.t + self.num_optimize_ahead,))
+            self._update_thread.start()
+
+        return action
+
+    def _traj_opt(self, x0):
+        if self.sol is not None:
+            log.warn('re-optimizing trajectory mid-flight!')
+        else:
+            log.info('optimizing trajectory')
+
+        # Throw away current update step, as it is irrelevant anyway.
+        if self._update_thread is not None and self._update_thread.is_alive():
+            log.warn('waiting for current optimization to finish')
+            self._update_thread.join()
+
+        sol = self.solver(x0, initial=None, callback=self._cb,
+                          atol=5e0, λ_base=3.0, ln_λ=-5,
+                          ln_λ_max=20, iter_max=50)
+        self.sol = sol
+        self.t = 0
+        return sol.actions[0]
+
+    def _update(self, n):
+        "Update current trajectory estimate from point n."
+        # New set of actions U_ is an extension of U into the future.
+        U_ = self.actions
+        if U_ is not None:
+            U_ = U_[n:][:self.solver.T]
+            filler = np.repeat(U_[-1][None], self.solver.T-U_.shape[0], axis=0)
+            U_ = np.vstack((U_, filler))
+
+        sol = self.solver(self.states[n], initial=U_, callback=self._cb,
+                          atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
+                          iter_max=50)
+
+        with self.lock:
+            self.sol = sol
 
 def make_quad_policy(*, dt=DT, T=Tl, tolerance=2e0, **kw):
     solver = make_quad(dt=dt, T=T, **kw)
-    Qf, Q, R = solver.cost_matrices
-    X, U, Ks, ks, th, t = None, None, None, None, None, 0
-
-    import threading
-    lock = threading.Lock()
-
-    def cb(x0, U):
-        if hasattr(action, 'tracker'):
-            action.tracker.set_trajectory(TrajTuple(model.step_array(x0, U, dt), U))
-
-    def action(x0):
-        nonlocal X, U, Ks, ks, th, t
-
-        q = qf(Q, (X[t] - x0)) if X is not None else np.inf
-
-        if q < tolerance:
-            dists = np.linalg.norm(X[t:t+10, 0:3] - x0[0:3], axis=1)
-            t = t + dists.argmin()
-
-            # Re-run controllers from x_t
-            with lock:
-                X[t] = x0
-                X[t:], U[t:] = solver.forward_pass(Ks[t:], 0*ks[t:], X[t:], U[t:])
-
-                if X.shape[0] < 5:
-                    X = None
-
-            if th is None or not th.is_alive():
-                #X, U, Ks, ks, t = X[t:], U[t:], Ks[t:], ks[t:], 0
-                th = threading.Thread(target=update, args=(t+100,))
-                th.start()
-
-            return U[t]
-
-        else:
-            if X is not None:
-                log.warn('re-optimizing trajectory mid-flight!')
-            else:
-                log.info('optimizing trajectory')
-
-            # Throw away current update step, as it is irrelevant anyway.
-            if th is not None:
-                th.join()
-
-            (X, U), Ks, ks = solver(x0, initial=None, callback=lambda U: cb(x0, U),
-                                    atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
-                                    iter_max=50, return_controllers=True)
-            t = 0
-            return U[t]
-
-    def update(n):
-        "Update current trajectory estimate from point n."
-        nonlocal X, U, Ks, ks
-
-        # New set of actions U_ is an extension of U into the future.
-        U_ = U
-        if U_ is not None:
-            U_ = U_[n:][:T]
-            filler = np.repeat(U_[-1][None], T-U_.shape[0], axis=0)
-            U_ = np.vstack((U_, filler))
-
-        trj, Ks_, ks_ = solver(X[n], initial=U_, callback=lambda U: cb(X[n], U),
-                               atol=5e0, λ_base=3.0, ln_λ=-5, ln_λ_max=20,
-                               iter_max=50, return_controllers=True)
-
-        # Safely update shared variables
-        with lock:
-            X = np.vstack((X[:n], trj.states))
-            U = np.vstack((U[:n], trj.actions))
-            Ks = np.vstack((Ks[:n], Ks_))
-            ks = np.vstack((ks[:n], ks_))
-
-    return action
+    return LinearTodayPolicy(solver=solver, tolerance=tolerance)
 
 def main(dt=DT, T=Tl, Tl=Tl, Tstep=Tl, n=10):
     import logcolor
     logcolor.basic_config(level=logging.DEBUG)
 
     solver = make_quad(dt=dt, T=T)
+    model = solver.model
 
     initials = []
     optimizeds = []

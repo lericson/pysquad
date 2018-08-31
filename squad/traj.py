@@ -94,26 +94,35 @@ class Viewer():
         w.opts['elevation'] = elevation
         w.opts['azimuth'] = azimuth
         w.opts['distance'] = distance
+        w.setHome()
         w.setBackgroundColor('#ccc')
         w.addItem(AxisItem(antialias=True))
         w.update()
 
-    def plot_traj_kwds(self, history, color='#fff', width=0.5):
+    def plot_traj_kwds(self, history=None, states=None, color='#fff',
+                       width=0.5, alternate=50):
         import pyqtgraph as pg
-        if history and len(history) > 1:
+        if states is None and history:
             _, states, *_ = to_parts(history)
-            edges = np.arange(states.shape[0]) - 1
-            line_segs = np.vstack([states[(dst, edges[dst]), 0:3]
-                                   for dst in range(states.shape[0])
-                                   if edges[dst] >= 0])
+        if states is None or states.shape[0] <= 1:
+            segs, colors = None, None
         else:
-            line_segs = None
-        #color = np.ones((line_segs.shape[0], 4))
-        #color[:, 0:3] = np.c_[0.5, 0.5, 0.5] + (p[edges >= 0][:, None]/2)
-        return dict(pos=line_segs, color=pg.glColor(color),
-                    antialias=True, mode='lines')
+            edges = np.arange(states.shape[0]) - 1
+            segs = np.vstack([states[(dst, edges[dst]), 0:3]
+                              for dst in range(states.shape[0])
+                              if edges[dst] >= 0])
+            colors = np.empty((segs.shape[0], 4))
+            colors[:, :] = pg.glColor(color)
+            for i in range(0*alternate, 1*alternate):
+                colors[i::2*alternate, 3] *= 1.0
+            for i in range(1*alternate, 2*alternate):
+                colors[i::2*alternate,   3] *= 0.25
+                # Inverted colors in RGB space
+                #colors[i::2*alternate, 0:3] -= 1.0
+                #colors[i::2*alternate, 0:3] *= -1.0
+        return dict(pos=segs, color=colors, antialias=True, mode='lines')
 
-    def plot_traj(self, history, **kw):
+    def plot_traj(self, history=None, **kw):
         import pyqtgraph.opengl as gl
         #import pyqtgraph as pg
         #_, x0, *_ = history[0]
@@ -139,8 +148,12 @@ class Viewer():
         QtGui.QApplication.instance().exec_()
 
 class Tracker(Viewer):
-    def __init__(self, *args, autopan=True, axis=True, parent=None,
-                 plot_opts={}, **kwds):
+    # Copied from matplotlib
+    autocolors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
+    def __init__(self, *args, autopan=True, axis=True,
+                 parent=None, plot_opts={}, num_history=100, **kwds):
         if parent is None:
             super().__init__(*args, **kwds)
         else:
@@ -154,23 +167,47 @@ class Tracker(Viewer):
         else:
             self.axis = None
         self.w.addItem(self.axis)
+        autocolor = plot_opts.pop('autocolor', None)
+        if autocolor is not None:
+            color_idx = autocolor % len(self.autocolors)
+            plot_opts['color'] = self.autocolors[color_idx]
         self.plot_opts = plot_opts
         self.line_plot = self.plot_traj([], **self.plot_opts)
+        self.alts = [self.alt(autocolor=i)
+                     for i in range(num_history)] if parent is None else []
+        self._lru_ptr = 0
 
     def set_history(self, history):
         self.line_plot.setData(**self.plot_traj_kwds(history, **self.plot_opts))
+        self.line_plot.setVisible(True)
         _, x1, *_ = history[-1]
         if self.autopan:
             self.pan(*x1[0:3])
         if self.axis:
             self.axis.position = x1[0:3]
             self.axis.orientation = x1[3:7]
+            self.axis.setVisible(True)
+
+    def clear(self):
+        self.line_plot.setVisible(False)
+        if self.axis:
+            self.axis.setVisible(False)
+        for alt in self.alts:
+            alt.clear()
 
     def set_trajectory(self, trj):
         self.set_history([(None, x, u, None, None) for x, u in zip(trj.states, trj.actions)])
 
     def alt(self, **kwds):
         return type(self)(parent=self, autopan=False, plot_opts=kwds)
+
+    def alt_lru(self):
+        if not self.alts:
+            return None
+        alt = self.alts[self._lru_ptr]
+        self._lru_ptr += 1
+        self._lru_ptr %= len(self.alts)
+        return alt
 
 def main(args=sys.argv[1:]):
     logcolor.basic_config()

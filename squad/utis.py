@@ -1,6 +1,7 @@
 import os
+import sys
 from warnings import warn
-from collections import namedtuple
+from contextlib import contextmanager
 
 import numpy as np
 import numba as nb
@@ -108,3 +109,24 @@ def qf(Q, x):
 
 def assert_qf_isclose(Q, x, v):
     assert np.isclose(qf(Q, x), v), f'{x@Q@x} ≠ {v}, x:\n{x}'
+
+@contextmanager
+def forward_exceptions(*thread_objs):
+    """One for all, all for one
+
+    Context manager that in the event of an exception re-raises that same
+    exception in auxiliary threads given as *thread_objs*. Especially useful
+    for stopping worker threads in the event of a keyboard interrupt on the
+    main thread.
+    """
+    import ctypes
+    try:
+        yield
+    except:
+        exc = ctypes.py_object(sys.exc_info()[0])
+        for t in thread_objs:
+            tid = ctypes.c_long(t._ident)
+            ret = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, exc)
+            if ret != 1:
+                warn(f'mad return for {t}: {ret}')
+        raise

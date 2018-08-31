@@ -41,7 +41,7 @@ class Quad(ODEModel):
     #x_sample_mean = np.r_[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     #x_sample_len  = np.r_[4, 4, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1, 4, 0, 0, 0, 0]
     x_sample_mean = np.r_[0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    x_sample_std  = np.r_[1, 1, 1, 0, 0,.1,.1, 2, 2, 2,.2,.2,.4, 0, 0, 0, 0]
+    x_sample_std  = np.r_[1, 1, 1, 0, 0,.1,.1,.5,.5,.5,.1,.1,.2, 0, 0, 0, 0]
     state_dist = normal(x_sample_mean, x_sample_std)
 
     u_lower = np.zeros(num_rotors)
@@ -64,9 +64,10 @@ class Quad(ODEModel):
     def step(m, x, u, t=0, dt=1/400):
         x = x.astype(dtype=np.float64)
         attqnorm = np.linalg.norm(x[3:7])
-        assert attqnorm > 0.0, x
+        assert attqnorm > 0.0, (x, u)
         x[3:7] /= attqnorm
         u = u.astype(np.float64, copy=False)
+        u = np.clip(u, m.u_lower, m.u_upper)
         if ivp_method == 'scipy':
             return m.step_ivp(x, u, t=t, dt=dt)
         elif ivp_method == 'euler':
@@ -101,7 +102,7 @@ class Quad2D(Quad):
 
     #                     x  y  z qi qj qk qr vx vy vz wx wy wz w0 w1 w2 w3
     x_sample_mean = np.r_[0, 0, 0, 0,.2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    x_sample_std  = np.r_[1, 0, 1, 0,.1, 0,.1, 2, 0, 2, 0,.1, 0, 0, 0, 0, 0]
+    x_sample_std  = np.r_[1, 0, 1, 0,.1, 0,.1,.5, 0,.5, 0,.1, 0, 0, 0, 0, 0]
     state_dist = normal(x_sample_mean, x_sample_std)
 
 class QuadMix(Quad):

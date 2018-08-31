@@ -19,7 +19,7 @@ from .quadfast import ipy, ivy, iwx, iwz, iqi, iqk, iqr, eps
 iwx00, iwx01 = np.arange(qf.num_rotors)[qf.rotor_positions[:, 0] > 0]
 iwx10, iwx11 = np.arange(qf.num_rotors)[qf.rotor_positions[:, 0] < 0]
 
-@nb.njit(qf.x_dot_out.nopython_signatures, cache=True, nogil=True)
+@nb.njit(getattr(qf.x_dot_out, 'nopython_signatures', None), cache=True, nogil=True)
 def x_dot_out(t, x, u, x_):
     u[iwx01] = u[iwx00]
     u[iwx11] = u[iwx10]
