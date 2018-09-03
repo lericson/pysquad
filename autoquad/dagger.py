@@ -43,7 +43,7 @@ class configs:
         max_aggregated = 1_000_000
 
         #: Use worst rollouts from evaluation as learner rollouts
-        use_worst = env_param('use_worst', default=True, cast=str2bool)
+        sample_method = env_param('sample_method ', default='best_and_worst', cast=str)
 
         expert_class = QuadLQRExpert
         learner_class = TwoLayerPerceptron
@@ -134,16 +134,28 @@ def DaggerThread(*, config, tracker=None):
                     costs = [trj.cost for trj in trajs]
                     print('\t'.join(map(str, (i, *costs))), file=fileobj)
 
+                trajs.sort(key=lambda trj: trj.cost)
+
                 log.info('mean cost: %.3g', np.mean([trj.cost for trj in trajs]))
                 log.info('std cost: %.3g', np.std([trj.cost for trj in trajs]))
+                log.info('min cost: %.3g', trajs[0].cost)
+                log.info('max cost: %.3g', trajs[-1].cost)
 
-            if config.use_worst:
-                log.info('#%d using %d worst trajectories from evaluation',
+            if config.sample_method == 'worst':
+                log.info('#%d sampling %d worst trajectories',
                          i, config.num_learner)
-                trajs.sort(key=lambda trj: -trj.cost)
-                trajs = trajs[:config.num_learner]
-            else:
-                log.info('#%d sampling %d learner trajectories', i, config.num_learner)
+                trajs = trajs[-config.num_learner:]
+
+            elif config.sample_method == 'best_and_worst':
+                N_best = config.num_learner//2
+                N_worst = config.num_learner - N_best
+                log.info('#%d sampling %d+%d best+worst trajectories',
+                         i, N_best, N_worst)
+                trajs = trajs[:N_best] + trajs[-N_worst:]
+
+            elif config.sample_method == 'random':
+                log.info('#%d sampling %d random trajectories',
+                         i, config.num_learner)
                 #log.info('#%d theta:\n%s', i, learner.theta)
                 trajs = learner.unroll(model.sample_states(config.num_learner))
 
