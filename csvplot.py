@@ -77,7 +77,7 @@ parser.add_argument('--x-label', help='label for x axis', metavar='LABEL')
 parser.add_argument('--y-label', help='label for y axis', metavar='LABEL')
 parser.add_argument('--title', help='plot title')
 parser.add_argument('--output', metavar='FILE', help='save plot to FILE')
-parser.add_argument('--x-grid-minor-period', default=25, type=int, metavar='NUM',
+parser.add_argument('--x-grid-minor-period', default=1, type=int, metavar='NUM',
                     help='periodicity of minor grid along x axis')
 parser.add_argument('--x-grid-num-major', default=5, type=int, metavar='NUM',
                     help='number of major grid along x axis')

@@ -42,6 +42,9 @@ class configs:
         #: Limit of aggregated dataset size.
         max_aggregated = 1_000_000
 
+        #: Use worst rollouts from evaluation as learner rollouts
+        use_worst = env_param('use_worst', default=True, cast=str2bool)
+
         expert_class = QuadLQRExpert
         learner_class = TwoLayerPerceptron
 
@@ -133,11 +136,12 @@ def DaggerThread(*, config, tracker=None):
 
                 log.info('mean cost: %.3g', np.mean([trj.cost for trj in trajs]))
                 log.info('std cost: %.3g', np.std([trj.cost for trj in trajs]))
-                log.info('#%d using %d worst trajectories in evaluation',
+
+            if config.use_worst:
+                log.info('#%d using %d worst trajectories from evaluation',
                          i, config.num_learner)
                 trajs.sort(key=lambda trj: -trj.cost)
                 trajs = trajs[:config.num_learner]
-
             else:
                 log.info('#%d sampling %d learner trajectories', i, config.num_learner)
                 #log.info('#%d theta:\n%s', i, learner.theta)

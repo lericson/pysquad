@@ -36,12 +36,17 @@ def lineno_resolver(key):
 def np_func_resolver(key):
     return [key], getattr(np, key)
 
-@stat_func_resolver(r'(asc|first|top|desc|last|bot(?:tom)?)(\d+)')
-def sorted_n(key, order, n):
+@stat_func_resolver(r'(asc|first|top|desc|last|bot(?:tom)?)(\d+)(st|rd|th)?')
+def sorted_n(key, order, n, ordinal_suffix):
     n = int(n)
+    definite = bool(ordinal_suffix)
     sign = -1 if order in {'desc', 'last', 'bot', 'bottom'} else +1
-    field_names = [f'{order}[{sign*i}]' for i in range(n)]
-    return field_names, lambda row: row[np.argsort(sign*row)[:n]]
+    if not definite:
+        start, stop = 0, n
+    else:
+        start, stop = n, n + 1
+    field_names = [f'{order}[{sign*i}]' for i in range(start, stop)]
+    return field_names, lambda row: sign*np.sort(sign*row)[start:stop]
 
 @stat_func_resolver(r'(\d+(?:\.\d+)?)%')
 def percentile_resolver(key, perc):
