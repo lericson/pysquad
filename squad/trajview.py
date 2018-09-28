@@ -371,7 +371,7 @@ class GLViewWidget(QtOpenGL.QGLWidget):
     def evalKeyState(self):
         speed = 2.0
         if self.keysPressed:
-            for key in self.keysPressed:
+            for key in list(self.keysPressed):
                 if key == QtCore.Qt.Key_Right:
                     self.orbit(azim=-speed, elev=0)
                 elif key == QtCore.Qt.Key_Left:
@@ -382,19 +382,18 @@ class GLViewWidget(QtOpenGL.QGLWidget):
                     self.orbit(azim=0, elev=speed)
                 elif key == QtCore.Qt.Key_H:
                     self.opts.update(self.opts['home'])
-                    self.update()
                 elif key == QtCore.Qt.Key_P:
                     self.keysPressed.discard(key)
                     m = {'perspective':  'orthographic',
                          'orthographic': 'perspective'}
                     self.projection = m[self.projection]
-                    self.update()
                 elif key == QtCore.Qt.Key_PageUp:
                     self.opts['distance'] *= 0.99**speed
                     #self.pan(speed, speed, 0, relative=True)
                 elif key == QtCore.Qt.Key_PageDown:
                     self.opts['distance'] /= 0.99**speed
                     #self.pan(-speed, -speed, 0, relative=True)
+                self.update()
                 self.keyTimer.start(16)
         else:
             self.keyTimer.stop()
