@@ -102,6 +102,12 @@ def str2bool(value):
         return False
     raise ValueError(value)
 
+def str2list(s, *, cast=None, delimiter=',', strip=True):
+    if cast is None:
+        cast = lambda n: n
+    return [cast(n.strip() if strip else n) for n in s.split(',')]
+str2list.cast = lambda cast: (lambda s, **k: str2list(s, **k, cast=cast))
+
 @nb.njit(['f8(f8[:, ::], f8[:])'], nogil=True, cache=True)
 def qf(Q, x):
     "Evaluate quadratic form $y = x^T Q x$."
@@ -119,14 +125,23 @@ def forward_exceptions(*thread_objs):
     for stopping worker threads in the event of a keyboard interrupt on the
     main thread.
     """
-    import ctypes
     try:
         yield
     except:
-        exc = ctypes.py_object(sys.exc_info()[0])
-        for t in thread_objs:
-            tid = ctypes.c_long(t._ident)
-            ret = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, exc)
-            if ret != 1:
-                warn(f'mad return for {t}: {ret}')
+        exc_class = sys.exc_info()[0]
+        raise_in_threads(exc_class, *thread_objs)
         raise
+
+def raise_in_threads(exc_class, *thread_objs):
+    import ctypes
+    import threading
+    current_thread = threading.current_thread()
+    PyThreadState_SetAsyncExc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+    PyThreadState_SetAsyncExc.argtypes = ctypes.c_long, ctypes.py_object
+    PyThreadState_SetAsyncExc.restype = ctypes.c_int
+    for t in thread_objs:
+        if t is current_thread or not t.is_alive():
+            continue
+        ret = PyThreadState_SetAsyncExc(t.ident, exc_class)
+        if ret != 1:
+            warn(f'error return for {t}: {ret}')
