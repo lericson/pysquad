@@ -11,9 +11,6 @@ from .utis import clip, env_param, qf
 #from models.pointmass import PointMass
 
 class Solution(traj.Trajectory):
-    max_jump_steps = 10
-    max_state_error = 2e1
-
     def sample(self, *, n, sigma2):
         # Future work: sample trajectories simultaneously by replacing the
         # state and action vectors by matrices.
@@ -25,16 +22,11 @@ class Solution(traj.Trajectory):
             self.states[start] = state
         return self._sample_one(start=start)
 
-    def _sample_one(self, sigma2=0.0, start=0, warn=True):
+    def _sample_one(self, sigma2=0.0, start=0):
         X_new = np.empty_like(self.states)
         U_new = np.empty_like(self.actions)
         X_new[start] = self.states[start]
         for i in range(start, self.actions.shape[0]):
-            error = np.linalg.norm(self.states[i, 0:3] - X_new[i, 0:3])
-            if warn and error > self.max_state_error:
-                warn = False
-                log.warn('position deviates from reference trajectory '
-                         '(%.3g), control likely nonsensical', error)
             xi, ui = self.states[i], self.actions[i]
             Ki, ki = self.controllers[i]
             ui_new = ui + ki + Ki @ (X_new[i] - xi)
@@ -170,7 +162,7 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
         X[0] = x0
         for i in range(T):
             U[i] = policy(X[i])
-            U[i] = clip_action(U[i])
+            clip_action(U[i])
             X[i+1] = step_eul(X[i], U[i], dt=dt)
         return traj.Trajectory(dt=dt, states=X, actions=U)
 
@@ -194,25 +186,24 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             cost.derivatives(X[i], U[i], x_goal, lx[i], lu[i], lxx[i], lxu[i], luu[i], lux[i])
         return V_x, V_xx, fx, fu, lx, lu, lxx, lxu, luu, lux
 
-    @nb.njit('f8[:](f8[:])', cache=True, nogil=True)
+    @nb.njit('none(f8[:])', cache=True, nogil=True)
     def clip_action(u):
         for i in range(action_shape[0]):
             if u[i] < u_lower[i]:
                 u[i] = u_lower[i]
             if u_upper[i] < u[i]:
                 u[i] = u_upper[i]
-        return u
 
     @nb.njit(cache=True, nogil=True)
-    def forward_pass(K, k, X, U):
-        X_new = np.empty_like(X)
-        U_new = np.empty_like(U)
+    def forward_pass(K, k, X, U, α, X_new, U_new):
         X_new[0] = X[0]
         for i in range(U.shape[0]):
-            U_new[i] = clip_action(U[i] + k[i] + K[i] @ (X_new[i] - X[i]))
+            U_new[i]  = U[i]
+            U_new[i] += α*k[i]
+            U_new[i] += α*K[i] @ (X_new[i] - X[i])
+            clip_action(U_new[i])
             X_new[i+1] = step_eul(X_new[i], U_new[i], dt=dt)
             #_, X_new[i+1], _ = model.step(X_new[i], U_new[i], dt=dt)
-        return X_new, U_new
 
     @nb.njit(cache=True, nogil=True)
     def is_finite(a):
@@ -259,11 +250,13 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             np.dot(neg_KTQuu, K[i], out=V_xx); V_xx += Qxx
 
     #@nb.njit(cache=True, nogil=True)
-    def ddp(x0, x_goal, U, ln_λ=-5, ln_λ_max=55, λ_base=1.5,
+    def ddp(x0, x_goal, U, ln_λ=-5, ln_λ_max=55, λ_base=1.5, num_α=5,
             iter_max=1000, atol=5e-1, callback=None, require_convergence=True):
         t0     = time.time()
         T      = U.shape[0]
         X      = model.step_array(x0, U, dt=dt)
+        X_new  = np.empty_like(X)
+        U_new  = np.empty_like(U)
         k_new  = np.empty((T,) + action_shape)
         K_new  = np.empty((T,) + action_shape + state_shape)
         fx     = np.empty((T,) + state_shape + state_shape)
@@ -288,10 +281,10 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
             callback(X, U)
 
         ln_λ_start = ln_λ
-        line_search_failed = True
+        λ_found = False
+
         for i in range(iter_max):
-            #if not all(np.all(np.isfinite(d)) for d in derivs):
-            #    log.warn('non-finite derivatives:\n%s', derivs)
+
             try:
                 backward_pass(K_new, k_new, *derivs, Qx, Qu, Qxx, Quu, Qux,
                               λ_base**ln_λ)
@@ -299,28 +292,38 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
                 #log.debug('rej, min(c): %.5g, ln λ: %d, overflow', c, ln_λ)
                 ln_λ += 1
                 continue
-            X_new, U_new = forward_pass(K_new, k_new, X, U)
-            c_new = cost.trajectory(X_new, U_new, x_goal)
-            change = c - c_new
-            if change > atol or (change > 0 and n_updt == 0):
-                log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
-                X_ref, U_ref = X, U
-                c, X, U, K, k = c_new, X_new, U_new, K_new.copy(), k_new.copy()
-                derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
-                n_updt += 1
-                ln_λ -= 1
-                line_search_failed = False
-                if callback is not None:
-                    callback(X, U)
+
+            for α in np.linspace(1.0, 0.0, num_α, endpoint=False):
+
+                forward_pass(K_new, k_new, X, U, α, X_new, U_new)
+                c_new = cost.trajectory(X_new, U_new, x_goal)
+                change = c - c_new
+
+                if change > atol or (change > 0 and n_updt == 0):
+                    log.debug('acc, min(c): %.5g, c: %.5g, ln λ: %d, α: %.2f'
+                              ' change %.3g', c, c_new, ln_λ, α, change)
+                    X_ref, U_ref = X, U
+                    c = c_new
+                    X, U = X_new.copy(), U_new.copy()
+                    K, k = α*K_new.copy(), α*k_new.copy()
+                    derivs = _calc_derivatives(cost, X, U, x_goal, fx, fu, lx, lu, lxx, lxu, luu, lux)
+                    n_updt += 1
+                    ln_λ -= 1
+                    λ_found = True
+                    if callback is not None:
+                        callback(X, U)
+                    break
+
             else:
                 #log.debug('rej, min(c): %.5g, c: %.5g, ln λ: %d, change %.3g', c, c_new, ln_λ, change)
                 ln_λ += 1
                 if ln_λ > ln_λ_max:
-                    if line_search_failed:
+                    if not λ_found:
                         break
                     log.debug('resetting λ')
                     ln_λ = ln_λ_start
-                    line_search_failed = True
+                    λ_found = False
+
         else:
             if require_convergence:
                 raise ValueError(f'no convergence in {i} iterations')
@@ -346,7 +349,6 @@ def make(*, model, cost, x_goal, dt=DT, T=Tl, initial=None,
         return ddp(x0, x_goal, initial, **kw)
 
     solver.initial_traj = initial_traj
-    solver.forward_pass = forward_pass
     solver.x_goal = x_goal
     solver.dt = dt
     solver.T = T
@@ -369,11 +371,11 @@ def make_quad(*, model=None, **kw):
 
     # Here L is the sum of projections of body axes onto inertial frame, plus
     # extra for Z.
-    q_axis_x, q_axis_y, q_axis_z = 3e0, 3e0, 5e0
-    Qf[iqi] = -q_axis_x + q_axis_y + q_axis_z
-    Qf[iqj] = +q_axis_x - q_axis_y + q_axis_z
-    Qf[iqk] = +q_axis_x + q_axis_y - q_axis_z
-    Qf[iqr] = -q_axis_x - q_axis_y - q_axis_z
+    #q_axis_x, q_axis_y, q_axis_z = 3e0, 3e0, 5e0
+    #Qf[iqi] = -q_axis_x + q_axis_y + q_axis_z
+    #Qf[iqj] = +q_axis_x - q_axis_y + q_axis_z
+    #Qf[iqk] = +q_axis_x + q_axis_y - q_axis_z
+    #Qf[iqr] = -q_axis_x - q_axis_y - q_axis_z
 
     Qf = np.diag(Qf)
 
@@ -465,13 +467,13 @@ class LinearTodayPolicy():
 
     def _traj_opt(self, x0):
         if self.sol is not None:
-            log.warn('re-optimizing trajectory mid-flight!')
+            log.warning('re-optimizing trajectory mid-flight!')
         else:
             log.info('optimizing trajectory')
 
         # Throw away current update step, as it is irrelevant anyway.
         if self._update_thread is not None and self._update_thread.is_alive():
-            log.warn('waiting for current optimization to finish')
+            log.warning('waiting for current optimization to finish')
             self._update_thread.join()
 
         sol = self.solver(x0, initial=None, callback=self._cb,
