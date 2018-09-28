@@ -1,0 +1,7 @@
+numba
+numpy
+scipy
+matplotlib
+logcolor
+pyqtgraph
+pyopengl
