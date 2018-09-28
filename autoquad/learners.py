@@ -281,12 +281,12 @@ class TwoLayerPerceptron(GradientDescentLearner):
     batch_size = 64
     order = 1
 
-    def __init__(self, *, state_shape, num_epochs=10, num_hidden=(150, 150, 150),
+    def __init__(self, *, state_shape, num_epochs=10, num_units=(150, 150),
                  learning_rate=1e-4, **kwds):
         super().__init__(**kwds)
         import torch
         modules = []
-        dims = [*state_shape, *num_hidden, *self.model.action_shape]
+        dims = [*state_shape, *num_units, *self.model.action_shape]
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
             modules.append(torch.nn.Linear(in_dim, out_dim))
             modules.append(torch.nn.ELU())
